@@ -1,0 +1,75 @@
+-module(lib_amqp).
+
+-include_lib("rabbitmq_server/include/rabbit.hrl").
+-include_lib("rabbitmq_server/include/rabbit_framing.hrl").
+-include("amqp_client.hrl").
+
+-compile(export_all).
+
+start_connection() ->
+    amqp_connection:start("guest", "guest").
+
+start_connection(Host) ->
+    amqp_connection:start("guest", "guest", Host).    
+
+start_channel(Connection) ->
+    amqp_connection:open_channel(Connection).
+    
+declare_exchange(Channel,X) ->
+    ExchangeDeclare = #'exchange.declare'{exchange = X,
+                                          type = <<"direct">>,
+                                          passive = false, durable = false, 
+                                          auto_delete = false, internal = false,
+                                          nowait = false, arguments = []},
+    amqp_channel:call(Channel, ExchangeDeclare).
+    
+publish(Channel,X,RoutingKey,Payload) ->
+    BasicPublish = #'basic.publish'{exchange = X,
+                                    routing_key = RoutingKey,
+                                    mandatory = false,immediate = false},
+    Content = #content{class_id = 60,
+                   properties = amqp_util:basic_properties(), 
+                   properties_bin = none,
+                   payload_fragments_rev = [Payload]},
+    amqp_channel:cast(Channel, BasicPublish, Content).    
+    
+teardown(Connection,Channel) ->
+    ChannelClose = #'channel.close'{reply_code = 200, reply_text = <<"Goodbye">>,
+                                    class_id = 0, method_id = 0},
+    amqp_channel:call(Channel, ChannelClose),
+    ConnectionClose = #'connection.close'{reply_code = 200, reply_text = <<"Goodbye">>,
+                                              class_id = 0, method_id = 0},
+    amqp_connection:close(Connection, ConnectionClose).
+    
+    
+subscribe(Channel,Q,Consumer) ->
+    BasicConsume = #'basic.consume'{queue = Q,
+                                    no_local = false, no_ack = true,
+                                    exclusive = false, nowait = false},
+    #'basic.consume_ok'{consumer_tag = ConsumerTag} = amqp_channel:call(Channel,BasicConsume, Consumer),
+    ConsumerTag.
+
+unsubscribe(Channel,Tag) ->
+    BasicCancel = #'basic.cancel'{consumer_tag = Tag, nowait = false},
+    #'basic.cancel_ok'{consumer_tag = ConsumerTag} = amqp_channel:call(Channel,BasicCancel),
+    ok.
+
+declare_queue(Channel,Q) ->
+    QueueDeclare = #'queue.declare'{queue = Q,
+                                    passive = false, durable = false,
+                                    exclusive = false, auto_delete = false,
+                                    nowait = false, arguments = []},
+    #'queue.declare_ok'{} = amqp_channel:call(Channel, QueueDeclare).
+
+delete_queue(Channel,Q) ->
+    QueueDelete = #'queue.delete'{queue = Q,
+                                  if_unused = false,
+                                  if_empty = false,
+                                  nowait = false},
+    #'queue.delete_ok'{} = amqp_channel:call(Channel, QueueDelete).
+
+bind_queue(Channel,X,Q,Binding) ->
+    QueueBind = #'queue.bind'{queue = Q, exchange = X,
+                              routing_key = Binding, nowait = false, arguments = []},
+    #'queue.bind_ok'{} = amqp_channel:call(Channel, QueueBind).       
+
