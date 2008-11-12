@@ -36,6 +36,7 @@
 -export([call/2, call/3, cast/2, cast/3]).
 -export([register_direct_peer/2]).
 -export([register_return_handler/2]).
+-export([register_flow_handler/2]).
 
 %% This diagram shows the interaction between the different component processes
 %% in an AMQP client scenario.
@@ -74,7 +75,11 @@ call(Channel, Method) ->
 call(Channel, Method = #'basic.consume'{}, Consumer) ->
     %% TODO This requires refactoring, because the handle_call callback
     %% can perform the differentiation between tuples
-    gen_server:call(Channel, {basic_consume, Method, Consumer}).
+    gen_server:call(Channel, {basic_consume, Method, Consumer});
+
+%% Generic AMQP send mechansim with content
+call(Channel, Method, Content) ->
+    gen_server:call(Channel, {call, Method, Content}).
 
 %% Generic AMQP send mechansim that doesn't expect a response
 cast(Channel, Method) ->
@@ -103,6 +108,10 @@ register_direct_peer(Channel, Peer) ->
 register_return_handler(Channel, ReturnHandler) ->
     gen_server:cast(Channel, {register_return_handler, ReturnHandler} ).
 
+%% Registers a handler to deal with flow control
+register_flow_handler(Channel, FlowHandler) ->
+    gen_server:cast(Channel, {register_flow_handler, FlowHandler} ).
+
 %---------------------------------------------------------------------------
 % Internal plumbing
 %---------------------------------------------------------------------------
@@ -120,13 +129,13 @@ rpc_top_half(Method, From, State = #channel_state{writer_pid = Writer,
             ok
         end,
     {noreply, NewState}.
-    
+
 rpc_bottom_half(#'channel.close'{reply_code = ReplyCode, 
                                  reply_text = ReplyText},State) ->
     io:format("Channel received close from peer, code: ~p , message: ~p~n",[ReplyCode,ReplyText]),
     NewState = channel_cleanup(State),
     {stop, normal, NewState};
-    
+
 rpc_bottom_half(Reply, State = #channel_state{writer_pid = Writer,
                                               rpc_requests = RequestQueue,
                                               do2 = Do2}) ->
@@ -213,6 +222,19 @@ handle_method(ChannelCloseOk = #'channel.close_ok'{}, State) ->
     {noreply, NewState} = rpc_bottom_half(ChannelCloseOk, State),
     {stop, normal, NewState};
 
+%% This handles the flow control flag that the broker initiates.
+%% If defined, it informs the flow control handler to suspend submitting
+%% any content bearing methods
+handle_method(Flow = #'channel.flow'{active = Active},
+              State = #channel_state{writer_pid = Writer, do2 = Do2,
+                                     flow_handler_pid = FlowHandler}) ->
+    case FlowHandler of
+        undefined -> ok;
+        _ -> FlowHandler ! Flow
+    end,
+    Do2(Writer, #'channel.flow_ok'{active = Active}),
+    {noreply, State#channel_state{flow_control = not(Active)}};
+
 handle_method(Method, State) ->
     rpc_bottom_half(Method, State).
 
@@ -246,6 +268,15 @@ init([InitialState]) ->
 handle_call({call, Method}, From, State = #channel_state{closing = false}) ->
     rpc_top_half(Method, From, State);
 
+handle_call({call, Method, Content}, From,
+            State = #channel_state{flow_control = true}) ->
+    {reply, blocked, State};
+
+handle_call({call, Method, Content}, From,
+            State = #channel_state{writer_pid = Writer, do3 = Do3}) ->
+    Do3(Writer, Method, Content),
+    {reply, ok, State};
+
 %% Top half of the basic consume process.
 %% Sets up the consumer for registration in the bottom half of this RPC.
 handle_call({basic_consume, Method = #'basic.consume'{consumer_tag = Tag}, Consumer},
@@ -270,8 +301,17 @@ handle_cast({cast, Method}, State = #channel_state{writer_pid = Writer, do2 = Do
     Do2(Writer, Method),
     {noreply, State};
 
+%% This discards any message submitted to the channel when flow control is
+%% active
+handle_cast({cast, Method, _Content},
+            State = #channel_state{flow_control = true}) ->
+    % Discard the message and log it
+    io:format("Discarding content bearing method (~p) ~n", [Method]),
+    {noreply, State};
+
 %% Standard implementation of the cast/3 command
-handle_cast({cast, Method, Content}, State = #channel_state{writer_pid = Writer, do3 = Do3}) ->
+handle_cast({cast, Method, Content},
+            State = #channel_state{writer_pid = Writer, do3 = Do3}) ->
     Do3(Writer, Method, Content),
     {noreply, State};
 
@@ -285,6 +325,11 @@ handle_cast({register_direct_peer, Peer}, State) ->
 %% Registers a handler to process return messages
 handle_cast({register_return_handler, ReturnHandler}, State) ->
     NewState = State#channel_state{return_handler_pid = ReturnHandler},
+    {noreply, NewState};
+
+%% Registers a handler to process flow control messages
+handle_cast({register_flow_handler, FlowHandler}, State) ->
+    NewState = State#channel_state{flow_handler_pid = FlowHandler},
     {noreply, NewState};
 
 handle_cast({notify_sent, Peer}, State) ->

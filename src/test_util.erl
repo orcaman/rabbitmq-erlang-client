@@ -228,6 +228,106 @@ basic_qos_test(Connection) -> ok.
 % Reject is not yet implemented in RabbitMQ
 basic_reject_test(Connection) -> ok.
 
+
+%----------------------------------------------------------------------------
+% Unit test for the direct client
+% This just relies on the fact that a fresh Rabbit VM must consume more than
+% 0.1 pc of the system memory:
+% 0. Wait 1 minute to let memsup do stuff
+% 1. Make sure that the high watermark is set high
+% 2. Start a process to receive the pause and resume commands from the broker
+% 3. Register this as flow control notification handler
+% 4. Let the system settle for a little bit
+% 5. Set the threshold to the lowest possible value
+% 6. When the flow handler receives the pause command, it sets the watermark
+%    to a high value in order to get the broker to send the resume command
+% 7. Allow 5 secs to receive the pause and resume, otherwise timeout and fail
+channel_flow_test(Connection) ->
+    X = <<"amq.direct">>,
+    K = Payload = <<"x">>,
+    memsup:set_sysmem_high_watermark(0.99),
+    timer:sleep(1000),
+    Channel = lib_amqp:start_channel(Connection),
+    Parent = self(),
+    Child = spawn_link(fun() ->
+                    receive
+                        #'channel.flow'{active = false} ->
+                            blocked = lib_amqp:publish(Channel, 
+                                                       X, K, Payload),
+                            memsup:set_sysmem_high_watermark(0.99),
+                            receive
+                                #'channel.flow'{active = true} ->
+                                    Parent ! ok
+                            end
+                    end
+                  end),
+    amqp_channel:register_flow_handler(Channel, Child),
+    timer:sleep(1000),
+    memsup:set_sysmem_high_watermark(0.001),
+    receive
+        ok -> ok
+    after 10000 ->
+        io:format("Are you sure that you have waited 1 minute?~n"),
+        exit(did_not_receive_channel_flow)
+    end.
+
+%----------------------------------------------------------------------------
+% This is a test, albeit not a unit test, to see if the client
+% handles the channel.flow command.
+
+channel_flow_sync(Connection) ->
+    start_channel_flow(Connection, fun lib_amqp:publish/4).
+
+channel_flow_async(Connection) ->
+    start_channel_flow(Connection, fun lib_amqp:async_publish/4).
+
+start_channel_flow(Connection, PublishFun) ->
+    crypto:start(),
+    X = <<"amq.direct">>,
+    Key = uuid(),
+    Producer = spawn_link(fun() ->
+                            Channel = lib_amqp:start_channel(Connection),
+                            amqp_channel:register_flow_handler(Channel,
+                                                               self()),
+                            cf_producer_loop(Channel, X, Key, PublishFun)
+                          end),
+    Consumer = spawn_link(fun() ->
+                            Channel = lib_amqp:start_channel(Connection),
+                            Q = lib_amqp:declare_queue(Channel),
+                            lib_amqp:bind_queue(Channel, X, Q, Key),
+                            Tag = lib_amqp:subscribe(Channel, Q, self()),
+                            cf_consumer_loop(Channel, Tag)
+                          end),
+    {Producer, Consumer}.
+
+cf_consumer_loop(Channel, Tag) ->
+    receive
+        #'basic.consume_ok'{} -> cf_consumer_loop(Channel, Tag);
+        #'basic.cancel_ok'{} -> ok;
+        {#'basic.deliver'{delivery_tag = DeliveryTag}, Content} ->
+             lib_amqp:ack(Channel, DeliveryTag),
+             cf_consumer_loop(Channel, Tag);
+        stop ->
+             lib_amqp:unsubscribe(Channel, Tag),
+             ok
+    end.
+
+cf_producer_loop(Channel, X, Key, PublishFun) ->
+    receive
+        #'channel.flow'{active = false} ->
+            cf_producer_loop(Channel, X, Key, PublishFun);
+        #'channel.flow'{active = true} ->
+            receive
+                #'channel.flow'{active = false} ->
+                    cf_producer_loop(Channel, X, Key, PublishFun)
+            end;
+        stop -> ok
+    after 5 ->
+        PublishFun(Channel, X, Key, crypto:rand_bytes(10000)),
+        cf_producer_loop(Channel, X, Key, PublishFun)
+    end.
+%----------------------------------------------------------------------------
+
 setup_publish(Channel) ->
     Publish = #publish{routing_key = <<"a.b.c.d">>,
                        q = <<"a.b.c">>,
