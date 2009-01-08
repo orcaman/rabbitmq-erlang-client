@@ -258,18 +258,18 @@ channel_flow_test(Connection) ->
     timer:sleep(1000),
     Channel = lib_amqp:start_channel(Connection),
     Parent = self(),
-    Child = spawn_link(fun() ->
-                    receive
-                        #'channel.flow'{active = false} ->
-                            blocked = lib_amqp:publish(Channel, 
-                                                       X, K, Payload),
-                            memsup:set_sysmem_high_watermark(0.99),
-                            receive
-                                #'channel.flow'{active = true} ->
-                                    Parent ! ok
-                            end
-                    end
-                  end),
+    Child = spawn_link(
+              fun() ->
+                      receive
+                          #'channel.flow'{active = false} -> ok
+                      end,
+                      blocked = lib_amqp:publish(Channel, X, K, Payload),
+                      memsup:set_sysmem_high_watermark(0.99),
+                      receive
+                          #'channel.flow'{active = true} -> ok
+                      end,
+                      Parent ! ok
+              end),
     amqp_channel:register_flow_handler(Channel, Child),
     timer:sleep(1000),
     memsup:set_sysmem_high_watermark(0.001),
@@ -291,7 +291,6 @@ channel_flow_async(Connection) ->
     start_channel_flow(Connection, fun lib_amqp:async_publish/4).
 
 start_channel_flow(Connection, PublishFun) ->
-    crypto:start(),
     X = <<"amq.direct">>,
     Key = uuid(),
     Producer = spawn_link(
@@ -300,7 +299,8 @@ start_channel_flow(Connection, PublishFun) ->
             Parent = self(),
             FlowHandler = spawn_link(fun() -> cf_handler_loop(Parent) end),
             amqp_channel:register_flow_handler(Channel, FlowHandler),
-            cf_producer_loop(Channel, X, Key, PublishFun, 0)
+            Payload = << <<B:8>> || B <- lists:seq(1, 10000) >>,
+            cf_producer_loop(Channel, X, Key, PublishFun, Payload, 0)
         end),
     Consumer = spawn_link(
         fun() ->
@@ -324,23 +324,25 @@ cf_consumer_loop(Channel, Tag) ->
              ok
     end.
 
-cf_producer_loop(Channel, X, Key, PublishFun, N) when N rem 5000 =:= 0 ->
+cf_producer_loop(Channel, X, Key, PublishFun, Payload, N) 
+        when N rem 5000 =:= 0 ->
     io:format("Producer (~p) has sent about ~p messages since it started~n",
               [self(), N]),
-    cf_producer_loop(Channel, X, Key, PublishFun, N + 1);
+    cf_producer_loop(Channel, X, Key, PublishFun, Payload, N + 1);
 
-cf_producer_loop(Channel, X, Key, PublishFun, N) ->
-    case PublishFun(Channel, X, Key, crypto:rand_bytes(10000)) of 
+cf_producer_loop(Channel, X, Key, PublishFun, Payload, N) ->
+    case PublishFun(Channel, X, Key, Payload) of 
         blocked ->
             io:format("Producer (~p) is blocked, will go to sleep.....ZZZ~n",
                       [self()]),
             receive
                 resume ->
                     io:format("Producer (~p) has woken up :-)~n", [self()]),
-                    cf_producer_loop(Channel, X, Key, PublishFun, N + 1)
+                    cf_producer_loop(Channel, X, Key, 
+                                     PublishFun, Payload, N + 1)
             end;
         _ ->
-            cf_producer_loop(Channel, X, Key, PublishFun, N + 1)
+            cf_producer_loop(Channel, X, Key, PublishFun, Payload, N + 1)
     end.
 
 cf_handler_loop(Producer) ->
@@ -393,13 +395,13 @@ setup_publish(Channel, #publish{routing_key = RoutingKey,
     lib_amqp:publish(Channel, X, RoutingKey, Payload),
     {ok, Q}.
 
-teardown_test(Connection = {ConnectionPid, _Mode}) ->
+teardown_test(Connection) ->
     Channel = lib_amqp:start_channel(Connection),
     ?assertMatch(true, is_process_alive(Channel)),
-    ?assertMatch(true, is_process_alive(ConnectionPid)),
+    ?assertMatch(true, is_process_alive(Connection)),
     lib_amqp:teardown(Connection, Channel),
     ?assertMatch(false, is_process_alive(Channel)),
-    ?assertMatch(false, is_process_alive(ConnectionPid)).
+    ?assertMatch(false, is_process_alive(Connection)).
 
 setup_exchange(Channel, Q, X, Binding) ->
     lib_amqp:declare_exchange(Channel, X, <<"topic">>),
