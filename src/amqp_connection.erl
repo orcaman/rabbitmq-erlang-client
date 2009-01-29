@@ -33,8 +33,8 @@
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2]).
 -export([open_channel/1, open_channel/3]).
--export([start/2, start/3, start/4, close/2]).
--export([start_link/2, start_link/3, start_link/4]).
+-export([start/2, start/3, start/4, start/6, close/2]).
+-export([start_link/2, start_link/3, start_link/4, start_link/5]).
 
 %%---------------------------------------------------------------------------
 %% AMQP Connection API Methods
@@ -54,14 +54,26 @@ start(User, Password, ProcLink) when is_boolean(ProcLink) ->
 start(User, Password, Host) ->
     start(User, Password, Host, <<"/">>, false).
 
-start(User, Password, Host, VHost) ->
+start(User, Password, Host, SslOpts) when is_list(SslOpts)  -> 
+    start(User,Password,Host,<<"/">>,SslOpts,false);
+start(User, Password, Host, VHost) when is_binary(VHost) ->
     start(User, Password, Host, VHost, false).
 
+start(User, Password, Host, VHost, SslOpts) when is_list(SslOpts) -> 
+    start(User, Password, Host, VHost, SslOpts, false);
 start(User, Password, Host, VHost, ProcLink) ->
     InitialState = #connection_state{username = User,
                                      password = Password,
                                      serverhost = Host,
                                      vhostpath = VHost},
+    {ok, Pid} = start_internal(InitialState, amqp_network_driver, ProcLink),
+    Pid.
+start(User, Password, Host, VHost, SslOpts, ProcLink) when is_list(SslOpts) ->
+    InitialState = #connection_state{username = User,
+                                     password = Password,
+                                     serverhost = Host,
+                                     vhostpath = VHost,
+                                     sslopts=SslOpts},
     {ok, Pid} = start_internal(InitialState, amqp_network_driver, ProcLink),
     Pid.
 
@@ -71,8 +83,13 @@ start_link(User, Password) ->
 start_link(User, Password, Host) ->
     start(User, Password, Host, <<"/">>, true).
 
+start_link(User, Password, Host, SslOpts=[{_K,_V}|_T]) -> 
+    start(User, Password, Host, <<"/">>, SslOpts, true);
 start_link(User, Password, Host, VHost) ->
     start(User, Password, Host, VHost, true).
+
+start_link(User, Password, Host, VHost, SslOpts=[{_K,_V}|_T]) -> 
+    start(User, Password, Host, VHost, SslOpts, true).
 
 start_internal(InitialState, Driver, _Link = true) when is_atom(Driver) ->
     gen_server:start_link(?MODULE, [InitialState, Driver], []);
