@@ -233,9 +233,63 @@ basic_recover_test(Connection) ->
     end,
     lib_amqp:teardown(Connection, Channel).
 
-%% QOS is not yet implemented in RabbitMQ
-basic_qos_test(Connection) ->
-    lib_amqp:close_connection(Connection).
+basic_qos_test(Con) ->
+    [NoQos, Qos] = [basic_qos_test(Con, Prefetch) || Prefetch <- [0,1]],
+    ExpectedRatio = (1+1) / (1+50/5),
+    FudgeFactor = 2, %% account for timing variations
+    ?assert(Qos / NoQos < ExpectedRatio * FudgeFactor).
+
+basic_qos_test(Connection, Prefetch) ->
+    Messages = 100,
+    Workers = [5, 50],
+    Parent = self(),
+    Chan = lib_amqp:start_channel(Connection),
+    Q = lib_amqp:declare_queue(Chan),
+    Kids = [spawn(fun() ->
+                    Channel = lib_amqp:start_channel(Connection),
+                    lib_amqp:set_prefetch_count(Channel, Prefetch),
+                    lib_amqp:subscribe(Channel, Q, self(), false),
+                    Parent ! finished,
+                    sleeping_consumer(Channel, Sleep, Parent)
+                  end) || Sleep <- Workers],
+    latch_loop(length(Kids)),
+    spawn(fun() -> producer_loop(lib_amqp:start_channel(Connection),
+                                 Q, Messages) end),
+    {Res, ok} = timer:tc(erlang, apply, [fun latch_loop/1, [Messages]]),
+    [Kid ! stop || Kid <- Kids],
+    latch_loop(length(Kids)),
+    lib_amqp:close_channel(Chan),
+    Res.
+
+sleeping_consumer(Channel, Sleep, Parent) ->
+    receive
+        stop ->
+            do_stop(Channel, Parent);
+        #'basic.consume_ok'{} ->
+            sleeping_consumer(Channel, Sleep, Parent);
+        #'basic.cancel_ok'{}  ->
+            ok;
+        {#'basic.deliver'{delivery_tag = DeliveryTag}, _Content} ->
+            Parent ! finished,
+            receive stop -> do_stop(Channel, Parent)
+            after Sleep -> ok
+            end,
+            lib_amqp:ack(Channel, DeliveryTag),
+            sleeping_consumer(Channel, Sleep, Parent)
+    end.
+
+do_stop(Channel, Parent) ->
+    Parent ! finished,
+    lib_amqp:close_channel(Channel),
+    exit(normal).
+
+producer_loop(Channel, _RoutingKey, 0) ->
+    lib_amqp:close_channel(Channel),
+    ok;
+
+producer_loop(Channel, RoutingKey, N) ->
+    lib_amqp:publish(Channel, <<>>, RoutingKey, <<>>),
+    producer_loop(Channel, RoutingKey, N - 1).
 
 %% Reject is not yet implemented in RabbitMQ
 basic_reject_test(Connection) ->
