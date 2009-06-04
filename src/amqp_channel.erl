@@ -344,7 +344,19 @@ handle_cast({register_flow_handler, FlowHandler}, State) ->
     {noreply, NewState};
 
 handle_cast({notify_sent, _Peer}, State) ->
-    {noreply, State}.
+    {noreply, State};
+
+%%---------------------------------------------------------------------------
+%% Network Writer methods (gen_server callbacks).
+%% These callbacks are invoked when a network channel sends messages
+%% to this gen_server instance.
+%%---------------------------------------------------------------------------
+
+handle_cast( {method, Method, none}, State) ->
+    handle_method(Method, State);
+
+handle_cast( {method, Method, Content}, State) ->
+    handle_method(Method, Content, State).
 
 %%---------------------------------------------------------------------------
 %% Rabbit Writer API methods (gen_server callbacks).
@@ -358,18 +370,9 @@ handle_info( {send_command, Method}, State) ->
 handle_info( {send_command, Method, Content}, State) ->
     handle_method(Method, Content, State);
 
-%%---------------------------------------------------------------------------
-%% Network Writer methods (gen_server callbacks).
-%% These callbacks are invoked when a network channel sends messages
-%% to this gen_server instance.
-%%---------------------------------------------------------------------------
-
-handle_info( {method, Method, none}, State) ->
-    handle_method(Method, State);
-
-handle_info( {method, Method, Content}, State) ->
-    handle_method(Method, Content, State);
-
+handle_info(shutdown, State) ->
+    NewState = channel_cleanup(State),
+    {stop, normal, NewState};
 
 %% Handles the delivery of a message from a direct channel
 handle_info( {send_command_and_notify, Q, ChPid, Method, Content}, State) ->
@@ -377,8 +380,6 @@ handle_info( {send_command_and_notify, Q, ChPid, Method, Content}, State) ->
     rabbit_amqqueue:notify_sent(Q, ChPid),
     {noreply, State};
 
-handle_info(shutdown, State) ->
-    {stop, normal, State};
 
 %% Handle a trapped exit, e.g. from the direct peer
 %% In the direct case this is the local channel
@@ -390,9 +391,8 @@ handle_info({'EXIT', _Pid, Reason},
     {stop, normal, State};
 
 %% This is for a channel exception that can't be otherwise handled
-handle_info( {channel_exception, Channel, Reason}, State) ->
-    io:format("Channel ~p is shutting down due to: ~p~n",[Channel, Reason]),
-    {stop, shutdown, State}.
+handle_info( {channel_exit, _Channel, Reason}, State) ->
+   {stop, Reason, State}.
 
 %%---------------------------------------------------------------------------
 %% Rest of the gen_server callbacks
