@@ -93,17 +93,23 @@ run:
 	erl -pa $(LOAD_PATH)
 
 
-all_tests: test_network test_network_coverage test_direct test_direct_coverage
+all_tests: test_network test_ssl test_network_coverage test_ssl_coverage test_direct test_direct_coverage
 	$(ERL_CALL) -q
 
-tests_network: test_network test_network_coverage
+tests_network: test_network test_ssl test_network_coverage test_ssl_coverage 
 	$(ERL_CALL) -q
 
 test_network: compile compile_tests
 	erl -pa $(LOAD_PATH) -noshell -eval 'network_client_test:test(),halt().'
 
+test_ssl: $(TARGETS)
+	erl -pa $(LOAD_PATH) -noshell -eval 'ssl_client_test:test(),halt().'
+
 test_network_coverage: compile compile_tests
 	erl -pa $(LOAD_PATH) -noshell -eval 'network_client_test:test_coverage(),halt().'
+
+test_ssl_coverage: $(TARGETS)
+	erl -pa $(LOAD_PATH) -noshell -eval 'ssl_client_test:test_coverage(),halt().'
 
 tests_direct: test_direct test_direct_coverage
 	$(ERL_CALL) -q
