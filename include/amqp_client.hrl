@@ -33,7 +33,8 @@
                            channel_max,
                            heartbeat,
                            driver,
-                           channels = dict:new() }).
+                           channels = dict:new(),
+                           sslopts=nil}).
 
 -record(channel_state, {number,
                         parent_connection,
@@ -59,4 +60,3 @@
 
 -record(rpc_server_state, {channel,
                            handler}).
-
