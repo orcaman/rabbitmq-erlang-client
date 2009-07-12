@@ -98,7 +98,6 @@ run: compile
 run_with_broker: compile
 	$(ERL_WITH_BROKER)
 
-
 all_tests: compile compile_tests
 	$(ERL_WITH_BROKER) -eval 'network_client_SUITE:test(),direct_client_SUITE:test(),halt()'
 
@@ -107,6 +106,9 @@ all_tests_coverage: compile compile_tests
 
 test_network: compile compile_tests
 	$(ERL_WITH_BROKER) -eval 'network_client_SUITE:test(),halt().'
+
+test_ssl: $(TARGETS)
+	erl -pa $(LOAD_PATH) -noshell -eval 'ssl_client_test:test(),halt().'
 
 test_network_coverage: compile compile_tests
 	$(ERL_WITH_BROKER) -eval 'network_client_SUITE:test_coverage(),halt().'
