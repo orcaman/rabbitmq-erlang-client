@@ -295,6 +295,86 @@ producer_loop(Channel, RoutingKey, N) ->
 basic_reject_test(Connection) ->
     lib_amqp:close_connection(Connection).
 
+%% ----------------------------------------------------------------------------
+%% Test for the network client
+%% Sets up a 'spammer' to publish async in the background, then sends a bunch
+%% of very important messages, and immediately closes the connection, without
+%% closing the two channels.
+%% Normally, we should expect that all important messages have left the socket,
+%% but not all of the spam messages have been sent, because there are
+%% significantly more and not all of them should have been buffered for
+%% delivery yet.
+%% So, in the end, if we set up a consumer, we should get all the important
+%% messages, but not all spam (we waited for all messages in buffer to be sent,
+%% but didn't allow further adding to the buffer).
+%% First connection is used for sending messages, second connection is used to
+%% get the messages.
+pub_and_close_test(Connection1, Connection2) ->
+    X = uuid(), Q = uuid(), Key = uuid(),
+    Payload = <<"eggs">>, NMessages = 50000,
+    SpamPayload = <<"spam">>, NSpamMessages = 300000,
+    Channel1 = lib_amqp:start_channel(Connection1),
+    Channel2 = lib_amqp:start_channel(Connection1),
+    lib_amqp:declare_exchange(Channel1, X),
+    lib_amqp:declare_queue(Channel1, Q),
+    lib_amqp:bind_queue(Channel1, X, Q, Key),
+    %% Setup spammer
+    spawn(?MODULE, pc_spammer_loop,
+          [Channel2, X, Key, SpamPayload, NSpamMessages]),
+    %% Send important messages
+    pc_producer_loop(Channel1, X, Key, Payload, NMessages),
+    %% Close connection without closing channels
+    lib_amqp:close_connection(Connection1, infinity),
+    %% Get sent messages back and count them
+    Channel3 = lib_amqp:start_channel(Connection2),
+    lib_amqp:subscribe(Channel3, Q, self(), true),
+    ConsumeRes = pc_consumer_loop(Channel3, Payload, SpamPayload, NMessages,
+                                  NSpamMessages),
+    lib_amqp:teardown(Connection2, Channel3),
+    pc_assert_consume_res_ok(ConsumeRes),
+    io:format("Consume results: ~p~n", [ConsumeRes]),
+    ok.
+
+pc_assert_consume_res_ok(ConsumeRes = {{_, NRemaining}, {_, NSpamRemaining}}) ->
+    if
+        NRemaining > 0 ->
+            exit({did_not_receive_all_messages, ConsumeRes});
+        NSpamRemaining == 0 ->
+            exit({did_not_expect_to_receive_all_spam, ConsumeRes});
+        true -> ok
+    end.
+
+pc_producer_loop(_, _, _, _, 0) -> ok;
+pc_producer_loop(Channel, X, Key, Payload, NRemaining) ->
+    NewNRemaining =
+        case lib_amqp:publish(Channel, X, Key, Payload) of
+            ok -> NRemaining - 1;
+            _  -> NRemaining
+        end,
+    pc_producer_loop(Channel, X, Key, Payload, NewNRemaining).
+
+pc_spammer_loop(_, _, _, _, 0) -> ok;
+pc_spammer_loop(Channel, X, Key, Payload, NRemaining) ->
+    lib_amqp:async_publish(Channel, X, Key, Payload),
+    pc_spammer_loop(Channel, X, Key, Payload, NRemaining - 1).
+
+pc_consumer_loop(Channel, Payload, SpamPayload, NRemaining, NSpamRemaining) ->
+    receive
+        {#'basic.deliver'{},
+         #content{payload_fragments_rev = [DeliveredPayload]}} ->
+            case DeliveredPayload of
+                Payload ->
+                    pc_consumer_loop(Channel, Payload, SpamPayload,
+                                     NRemaining - 1, NSpamRemaining);
+                SpamPayload ->
+                    pc_consumer_loop(Channel, Payload, SpamPayload,
+                                     NRemaining, NSpamRemaining - 1)
+            end
+    after 3000 ->
+        {{messages_remaining, NRemaining},{spam_remaining, NSpamRemaining}}
+    end.
+    
+
 %%----------------------------------------------------------------------------
 %% Unit test for the direct client
 %% This just relies on the fact that a fresh Rabbit VM must consume more than
