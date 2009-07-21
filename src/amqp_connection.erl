@@ -33,8 +33,9 @@
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2]).
 -export([open_channel/1, open_channel/3]).
--export([start/2, start/4, start/5, close/2]).
+-export([start/2, start/3, start/4, start/5, close/2, close/3]).
 -export([start_link/2, start_link/4, start_link/5]).
+-export([signal_back_when_no_channel_writing/2]).
 
 %%---------------------------------------------------------------------------
 %% AMQP Connection API Methods
@@ -95,8 +96,12 @@ open_channel(ConnectionPid, ChannelNumber, OutOfBand) ->
                     {open_channel, ChannelNumber,
                      amqp_util:binary(OutOfBand)}, infinity).
 
-%% Closes the AMQP connection
-close(ConnectionPid, Close) -> gen_server:call(ConnectionPid, Close, infinity).
+close(ConnectionPid, Close) ->
+    close(ConnectionPid, Close, infinity).
+
+%% Closes the AMQP connection. Timeout can be an int or the atom 'infinity'
+close(ConnectionPid, Close, Timeout) ->
+    gen_server:call(ConnectionPid, {Close, Timeout}, infinity).
 
 %%---------------------------------------------------------------------------
 %% Internal plumbing
@@ -183,8 +188,49 @@ allocate_channel_number(Channels, _Max) ->
     %% TODO check channel max and reallocate appropriately
     MaxChannel + 1.
 
-close_connection(Close, From, State = #connection_state{driver = Driver}) ->
+get_channels_pids(#connection_state{channels = ChannelDict}) ->
+    ChannelNums = dict:fetch_keys(ChannelDict),
+    lists:map(fun(ChannelNum) ->dict:fetch(ChannelNum, ChannelDict) end,
+              ChannelNums).
+
+close_connection(Close, From, State = #connection_state{driver = Driver},
+                 Timeout) ->
+    ChannelPids = get_channels_pids(State),
+    catch lists:foreach(fun amqp_channel:signal_closing/1, ChannelPids),
+    spawn(?MODULE, signal_back_when_no_channel_writing, [ChannelPids, self()]),
+    case Timeout of
+        infinity ->
+            receive
+                no_channel_writing -> ok
+            end;
+        _ ->
+            receive
+                no_channel_writing -> ok
+            after Timeout ->
+                io:format("Waiting for all channels to finish writing timed "
+                          "out. Forcing connection close!~n")
+            end
+    end,
     Driver:close_connection(Close, From, State).
+
+signal_back_when_no_channel_writing([], Parent) ->
+    catch Parent ! no_channel_writing;
+
+signal_back_when_no_channel_writing(ChannelPids = [ChanHead | ChanRem],
+                                    Parent) ->
+    Pass =
+        case catch amqp_channel:get_writer_status(ChanHead) of
+            {'EXIT', _} -> true;
+            {status, waiting} -> true;
+            _ -> false
+        end,
+    if
+        Pass ->
+            signal_back_when_no_channel_writing(ChanRem, Parent);
+        true ->
+            timer:sleep(3),
+            signal_back_when_no_channel_writing(ChannelPids, Parent)
+    end.
 
 %%---------------------------------------------------------------------------
 %% gen_server callbacks
@@ -200,8 +246,8 @@ handle_call({open_channel, ChannelNumber, OutOfBand}, _From, State) ->
     handle_open_channel({ChannelNumber, OutOfBand}, State);
 
 %% Shuts the AMQP connection down
-handle_call(Close = #'connection.close'{}, From, State) ->
-    close_connection(Close, From, State),
+handle_call({Close = #'connection.close'{}, Timeout}, From, State) ->
+    close_connection(Close, From, State, Timeout),
     {stop, normal, State}.
 
 %%---------------------------------------------------------------------------
