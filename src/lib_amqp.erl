@@ -210,3 +210,7 @@ unbind_queue(Channel, X, Q, Binding) ->
                              routing_key = Binding, arguments = []},
     #'queue.unbind_ok'{} = amqp_channel:call(Channel, Unbind).
 
+unbind_queue(Channel, X, Q, Binding) ->
+    Unbind = #'queue.unbind'{queue = Q, exchange = X,
+                             routing_key = Binding, arguments = []},
+    #'queue.unbind_ok'{} = amqp_channel:call(Channel, Unbind).
