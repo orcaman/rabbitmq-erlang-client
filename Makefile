@@ -62,6 +62,7 @@ RABBITMQ_NODENAME=rabbit
 BROKER_START_ARGS=-pa $(realpath $(LOAD_PATH))
 MAKE_BROKER=$(MAKE) RABBITMQ_SERVER_START_ARGS='$(BROKER_START_ARGS)' -C $(BROKER_DIR)
 ERL_CALL_BROKER=erl_call -sname $(RABBITMQ_NODENAME) -e
+RABBITMQCTL=$(BROKER_DIR)/scripts/rabbitmqctl
 
 PLT=$(HOME)/.dialyzer_plt
 DIALYZER_CALL=dialyzer --plt $(PLT)
@@ -238,9 +239,12 @@ clean_test_error_flag:
 start_testing: compile compile_tests \
                      start_background_node_in_broker \
                      clean_test_error_flag
+	$(RABBITMQCTL) delete_user test_user_no_perm || echo "No user to delete."
+	$(RABBITMQCTL) add_user test_user_no_perm test_user_no_perm
 
 .PHONY: cleanup_after_testing
 cleanup_after_testing:
+	$(RABBITMQCTL) delete_user no_perm_test_user
 
 .PHONY: end_testing
 end_testing: cleanup_after_testing stop_background_node_in_broker
