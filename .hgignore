@@ -2,4 +2,3 @@
 ^tmp/
 ^dist/
 ^erl_crash.dump$
-
