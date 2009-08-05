@@ -48,8 +48,8 @@ TEST_TARGETS=$(patsubst $(TEST_DIR)/%.erl, $(TEST_DIR)/%.beam, $(TEST_SOURCES))
 
 LOAD_PATH=$(EBIN_DIR) $(BROKER_DIR)/ebin $(TEST_DIR)
 
-COVER_START := -s cover start -s rabbit_misc enable_cover
-COVER_STOP := -s rabbit_misc report_cover -s cover stop
+COVER_START := -s cover start -s rabbit_misc enable_cover ../rabbitmq-erlang-client
+COVER_STOP := -s rabbit_misc report_cover ../rabbitmq-erlang-client -s cover stop
 
 ifndef USE_SPECS
 # our type specs rely on features / bug fixes in dialyzer that are
