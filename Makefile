@@ -30,6 +30,7 @@ export INCLUDE_SERV_DIR=$(BROKER_DIR)/include
 TEST_DIR=test
 SOURCE_DIR=src
 DIST_DIR=dist
+DEPS_DIR=deps
 
 DEPS=$(shell erl -noshell -eval '{ok,[{_,_,[_,_,{modules, Mods},_,_,_]}]} = \
                                  file:consult("rabbit_common.app"), \
@@ -46,6 +47,7 @@ TARGETS=$(patsubst $(SOURCE_DIR)/%.erl, $(EBIN_DIR)/%.beam, $(SOURCES))
 TEST_SOURCES=$(wildcard $(TEST_DIR)/*.erl)
 TEST_TARGETS=$(patsubst $(TEST_DIR)/%.erl, $(TEST_DIR)/%.beam, $(TEST_SOURCES))
 
+LIBS_PATH=ERL_LIBS=$(DEPS_DIR):$(DIST_DIR)
 LOAD_PATH=$(EBIN_DIR) $(BROKER_DIR)/ebin $(TEST_DIR)
 
 COVER_START := -s cover start -s rabbit_misc enable_cover ../rabbitmq-erlang-client
@@ -59,7 +61,7 @@ ifndef USE_SPECS
 export USE_SPECS=$(shell if [ $$(erl -noshell -eval 'io:format(erlang:system_info(version)), halt().') \> "5.6.2" ]; then echo "true"; else echo "false"; fi)
 endif
 
-ERLC_OPTS=-I $(INCLUDE_DIR) -I $(INCLUDE_SERV_DIR) -o $(EBIN_DIR) -Wall -v +debug_info $(shell [ $(USE_SPECS) = "true" ] && echo "-Duse_specs")
+ERLC_OPTS=-I $(INCLUDE_DIR) -o $(EBIN_DIR) -Wall -v +debug_info $(shell [ $(USE_SPECS) = "true" ] && echo "-Duse_specs")
 
 RABBITMQ_NODENAME=rabbit
 PA_LOAD_PATH=-pa $(realpath $(LOAD_PATH))
@@ -107,6 +109,22 @@ all_tests: prepare_tests
 	{ $(MAKE) test_suites || OK=false; } && \
 	{ $(MAKE) test_common_package || OK=false; } && \
 	$$OK
+
+$(DEPS_DIR)/$(COMMON_PACKAGE_NAME): $(BROKER_DIR)
+	$(MAKE) -C $(BROKER_DIR)
+	mkdir -p $(DEPS_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR)
+	mkdir -p $(DEPS_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)
+	cp $(COMMON_PACKAGE).app $(DEPS_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR)
+	$(foreach DEP, $(DEPS), \
+        ( cp $(BROKER_DIR)/$(EBIN_DIR)/$(DEP).beam \
+          $(DEPS_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR) \
+        );)
+	cp $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl \
+            $(DEPS_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)
+	(cd $(DEPS_DIR); zip -r $(COMMON_PACKAGE_NAME) $(COMMON_PACKAGE))
+
+$(EBIN_DIR)/%.beam: $(SOURCE_DIR)/%.erl $(INCLUDES) $(DEPS_DIR)/$(COMMON_PACKAGE_NAME)
+	mkdir -p $(EBIN_DIR); $(LIBS_PATH) erlc $(ERLC_OPTS) $<
 
 test_suites: prepare_tests
 	OK=true && \
@@ -201,7 +219,6 @@ common_package: $(BROKER_DIR)
         );)
 	(cd $(DIST_DIR); zip -r $(COMMON_PACKAGE_NAME) $(COMMON_PACKAGE))
 
-
 ###############################################################################
 ##  Internal targets
 ###############################################################################
@@ -216,3 +233,4 @@ $(BROKER_DIR):
 
 $(DIST_DIR):
 	mkdir -p $@
+
