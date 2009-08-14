@@ -31,14 +31,14 @@
 -compile(export_all).
 
 start_connection() ->
-    amqp_connection:start_direct(#amqp_connection_parameters{}).
+    amqp_connection:start_direct(#amqp_params{}).
 
 start_connection(Host) ->
-    amqp_connection:start_network(#amqp_connection_parameters{host = Host}).
+    amqp_connection:start_network(#amqp_params{host = Host}).
 
 start_connection(Host, Port) ->
-    amqp_connection:start_network(#amqp_connection_parameters{host = Host,
-                                                              port = Port}).
+    amqp_connection:start_network(#amqp_params{host = Host,
+                                               port = Port}).
 
 start_channel(Connection) ->
     amqp_connection:open_channel(Connection).

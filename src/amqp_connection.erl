@@ -46,9 +46,9 @@ start_direct(Params) -> start_direct_internal(Params, false).
 
 start_direct_link(Params) -> start_direct_internal(Params, true).
 
-start_direct_internal(#amqp_connection_parameters{username     = User,
-                                                  password     = Password,
-                                                  virtual_host = VHost},
+start_direct_internal(#amqp_params{username     = User,
+                                   password     = Password,
+                                   virtual_host = VHost},
                       ProcLink) ->
     InitialState = #connection_state{username  = User,
                                      password  = Password,
@@ -62,11 +62,11 @@ start_network(Params) -> start_network_internal(Params, false).
 
 start_network_link(Params) -> start_network_internal(Params, true).
 
-start_network_internal(#amqp_connection_parameters{username     = User,
-                                                   password     = Password,
-                                                   virtual_host = VHost,
-                                                   host         = Host,
-                                                   port         = Port},
+start_network_internal(#amqp_params{username     = User,
+                                    password     = Password,
+                                    virtual_host = VHost,
+                                    host         = Host,
+                                    port         = Port},
                        ProcLink) ->
     InitialState = #connection_state{username   = User,
                                      password   = Password,
