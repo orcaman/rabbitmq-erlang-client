@@ -78,6 +78,20 @@ RABBITMQ_NODENAME=rabbit
 PA_LOAD_PATH=-pa $(realpath $(LOAD_PATH))
 RABBITMQCTL=$(BROKER_DIR)/scripts/rabbitmqctl
 
+ifdef SSL_CERTS_DIR
+SSL := true
+ALL_SSL := { $(MAKE) test_ssl || OK_ALL=false; }
+ALL_SSL_COVERAGE := { $(MAKE) test_ssl_coverage || OK_ALL=false; }
+SSL_BROKER_ARGS := -rabbit ssl_listeners [{\\\"0.0.0.0\\\",5671}] \
+	-rabbit ssl_options [{cacertfile,\\\"$(SSL_CERTS_DIR)/testca/cacert.pem\\\"},{certfile,\\\"$(SSL_CERTS_DIR)/server/cert.pem\\\"},{keyfile,\\\"$(SSL_CERTS_DIR)/server/key.pem\\\"},{verify,verify_peer},{fail_if_no_peer_cert,true}] \
+	-erlang_client_ssl_dir \"$(SSL_CERTS_DIR)\"
+else
+SSL := @echo No SSL_CERTS_DIR defined. && false
+ALL_SSL := true
+ALL_SSL_COVERAGE := true
+SSL_BROKER_ARGS :=
+endif
+
 PLT=$(HOME)/.dialyzer_plt
 DIALYZER_CALL=dialyzer --plt $(PLT)
 
@@ -140,16 +154,18 @@ all_tests: prepare_tests
 	$$OK
 
 test_suites: prepare_tests
-	OK=true && \
-	{ $(MAKE) test_network || OK=false; } && \
-	{ $(MAKE) test_direct || OK=false; } && \
-	$$OK
+	OK_ALL=true && \
+	{ $(MAKE) test_network || OK_ALL=false; } && \
+	{ $(MAKE) test_direct || OK_ALL=false; } && \
+	$(ALL_SSL) && \
+	$$OK_ALL
 
 test_suites_coverage: prepare_tests
-	OK=true && \
-	{ $(MAKE) test_network_coverage || OK=false; } && \
-	{ $(MAKE) test_direct_coverage || OK=false; } && \
-	$$OK
+	OK_ALL=true && \
+	{ $(MAKE) test_network_coverage || OK_ALL=false; } && \
+	{ $(MAKE) test_direct_coverage || OK_ALL=false; } && \
+	$(ALL_SSL_COVERAGE) && \
+	$$OK_ALL
 
 ## This performs test setup and teardown procedures to ensure that
 ## that the correct users are configured in the test instance
@@ -157,7 +173,7 @@ run_test_broker: start_test_broker_node unboot_broker
 	OK=true && \
 	TMPFILE=$(MKTEMP) && \
 	{ $(MAKE) -C $(BROKER_DIR) run-node \
-		RABBITMQ_SERVER_START_ARGS="$(PA_LOAD_PATH) \
+		RABBITMQ_SERVER_START_ARGS="$(PA_LOAD_PATH) $(SSL_BROKER_ARGS) \
 		-noshell -s rabbit $(RUN_TEST_BROKER_ARGS) -s init stop" 2>&1 | \
 		tee $$TMPFILE || OK=false; } && \
 	{ egrep "All .+ tests (successful|passed)." $$TMPFILE || OK=false; } && \
@@ -182,11 +198,21 @@ unboot_broker:
 	$(MAKE) -C $(BROKER_DIR) stop-rabbit-on-node
 	$(MAKE) -C $(BROKER_DIR) stop-node
 
+ssl:
+	$(SSL)
+
+test_ssl: prepare_tests ssl
+	$(MAKE) run_test_broker RUN_TEST_BROKER_ARGS="-s ssl_client_SUITE test"
+
 test_network: prepare_tests
 	$(MAKE) run_test_broker RUN_TEST_BROKER_ARGS="-s network_client_SUITE test"
 
 test_direct: prepare_tests
 	$(MAKE) run_test_broker RUN_TEST_BROKER_ARGS="-s direct_client_SUITE test"
+
+test_ssl_coverage: prepare_tests ssl
+	$(MAKE) run_test_broker \
+	RUN_TEST_BROKER_ARGS="$(COVER_START) -s ssl_client_SUITE test $(COVER_STOP)"
 
 test_network_coverage: prepare_tests
 	$(MAKE) run_test_broker \
