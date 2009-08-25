@@ -3,4 +3,3 @@
 ^dist/
 ^deps/
 ^erl_crash.dump$
-
