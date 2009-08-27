@@ -30,7 +30,7 @@ DEPS=$(shell erl -noshell -eval '{ok,[{_,_,[_,_,{modules, Mods},_,_,_]}]} = \
 VERSION=0.0.0
 SOURCE_PACKAGE_NAME=$(PACKAGE)-$(VERSION)-src
 
-.PHONY: common_package
+.PHONY: common_package dist
 
 include common.mk
 
@@ -39,10 +39,17 @@ clean: common_clean
 	rm -fr $(DIST_DIR)
 	rm -fr $(DEPS_DIR)
 
+<<<<<<< local
+dist: doc source_tarball package
+=======
+>>>>>>> other
 
+<<<<<<< local
+=======
 $(INCLUDE_DIR)/version.hrl: $(INCLUDE_DIR)/version.hrl.in
 	sed -e 's:%%VERSION%%:$(VERSION):g' < $< > $@
 
+>>>>>>> other
 ##############################################################################
 ##  Testing
 ###############################################################################
@@ -71,22 +78,26 @@ common_package: $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
 
 $(DIST_DIR)/$(COMMON_PACKAGE_NAME): $(BROKER_SOURCES) $(BROKER_HEADERS)
 	$(MAKE) -C $(BROKER_DIR)
-	mkdir -p $(DIST_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)
-	mkdir -p $(DIST_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR)
-	cp $(COMMON_PACKAGE).app $(DIST_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR)
+	mkdir -p $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(INCLUDE_DIR)
+	mkdir -p $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(EBIN_DIR)
+	cp $(COMMON_PACKAGE).app $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(EBIN_DIR)
 	$(foreach DEP, $(DEPS), \
         ( cp $(BROKER_DIR)/$(EBIN_DIR)/$(DEP).beam \
-          $(DIST_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR) \
+          $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(EBIN_DIR) \
         );)
-	cp $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl $(DIST_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)
-	(cd $(DIST_DIR); zip -r $(COMMON_PACKAGE_NAME) $(COMMON_PACKAGE))
+	cp $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(INCLUDE_DIR)
+	(cd $(DIST_DIR); zip -r $(COMMON_PACKAGE_NAME) $(COMMON_PACKAGE_VSN))
 
+<<<<<<< local
+source_tarball: $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
+=======
 source_tarball: clean $(DIST_DIR)/$(COMMON_PACKAGE_NAME) $(INCLUDE_DIR)/version.hrl
+>>>>>>> other
 	mkdir -p $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(DIST_DIR)
 	$(COPY) $(DIST_DIR)/$(COMMON_PACKAGE_NAME) $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(DIST_DIR)/
 	$(COPY) README $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/
 	$(COPY) common.mk $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/
-	$(COPY) Makefile.in $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/Makefile
+	sed 's/%%VSN%%/$(VERSION)/' Makefile.in > $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/Makefile
 	mkdir -p $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(SOURCE_DIR)
 	$(COPY) $(SOURCE_DIR)/*.erl $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(SOURCE_DIR)/
 	mkdir -p $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(EBIN_DIR)
