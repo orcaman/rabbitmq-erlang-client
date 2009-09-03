@@ -75,8 +75,10 @@ TARGETS=$(patsubst $(SOURCE_DIR)/%.erl, $(EBIN_DIR)/%.beam, $(SOURCES))
 TEST_SOURCES=$(wildcard $(TEST_DIR)/*.erl)
 TEST_TARGETS=$(patsubst $(TEST_DIR)/%.erl, $(TEST_DIR)/%.beam, $(TEST_SOURCES))
 
-BROKER_HEADERS=$(wildcard $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl)
-BROKER_SOURCES=$(wildcard $(BROKER_DIR)/$(SOURCE_DIR)/*.erl)
+BROKER_HEADERS=$(wildcard $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl) \
+               $(BROKER_DIR)/$(INCLUDE_DIR)/rabbit_framing.hrl
+BROKER_SOURCES=$(wildcard $(BROKER_DIR)/$(SOURCE_DIR)/*.erl) \
+               $(BROKER_DIR)/$(SOURCE_DIR)/rabbit_framing.erl
 
 LIBS_PATH=ERL_LIBS=$(DEPS_DIR):$(DIST_DIR)
 LOAD_PATH=$(EBIN_DIR) $(BROKER_DIR)/ebin $(TEST_DIR)
@@ -99,6 +101,7 @@ ERLC_OPTS=-I $(INCLUDE_DIR) -o $(EBIN_DIR) -Wall -v +debug_info $(shell [ $(USE_
 RABBITMQ_NODENAME=rabbit
 PA_LOAD_PATH=-pa $(realpath $(LOAD_PATH))
 RABBITMQCTL=$(BROKER_DIR)/scripts/rabbitmqctl
+ERL_RABBIT_DIALYZER=erl -noinput -eval "code:load_abs(\"$(BROKER_DIR)/ebin/rabbit_dialyzer\")."
 
 ifdef SSL_CERTS_DIR
 SSL := true
@@ -114,15 +117,14 @@ ALL_SSL_COVERAGE := true
 SSL_BROKER_ARGS :=
 endif
 
-PLT=$(HOME)/.dialyzer_plt
-DIALYZER_CALL=dialyzer --plt $(PLT)
+PLT=rabbitmq-erlang-client.plt
+BROKER_PLT=$(BROKER_DIR)/rabbit.plt
 
-.PHONY: all compile compile_tests run run_in_broker dialyzer dialyze_all \
-	add_broker_to_plt prepare_tests all_tests test_suites \
-	test_suites_coverage run_test_broker start_test_broker_node \
-	stop_test_broker_node test_network test_direct test_network_coverage \
-	test_direct_coverage test_common_package clean source_tarball package \
-	boot_broker unboot_broker
+.PHONY: all compile compile_tests run run_in_broker dialyze create_plt \
+	prepare_tests all_tests test_suites test_suites_coverage run_test_broker \
+	start_test_broker_node stop_test_broker_node test_network test_direct \
+	test_network_coverage test_direct_coverage test_common_package clean \
+	source_tarball package boot_broker unboot_broker
 
 all: package
 
@@ -130,27 +132,18 @@ common_clean:
 	rm -f $(EBIN_DIR)/*.beam
 	rm -f erl_crash.dump
 	rm -fr $(DOC_DIR)
+	rm -f $(PLT) .last_valid_dialysis
 	$(MAKE) -C $(TEST_DIR) clean
 
 compile: $(TARGETS)
 
-compile_tests: $(TEST_DIR) $(COMPILE_DEPS) $(EBIN_DIR)/$(PACKAGE).app
-	$(MAKE) -C $(TEST_DIR)
+compile_tests: $(TEST_DIR) $(COMPILE_DEPS) $(EBIN_DIR)/$(PACKAGE).ap
 
 run: compile $(EBIN_DIR)/$(PACKAGE).app
 	erl -pa $(LOAD_PATH)
 
 run_in_broker: compile $(BROKER_DIR) $(EBIN_DIR)/$(PACKAGE).app
 	$(MAKE) RABBITMQ_SERVER_START_ARGS='$(PA_LOAD_PATH)' -C $(BROKER_DIR) run
-
-dialyze: $(TARGETS)
-	$(DIALYZER_CALL) -c $^
-
-dialyze_all: $(TARGETS) $(TEST_TARGETS)
-	$(DIALYZER_CALL) -c $^
-
-add_broker_to_plt: $(BROKER_DIR)/ebin
-	$(DIALYZER_CALL) --add_to_plt -r $<
 
 $(DOC_DIR)/overview.edoc: $(SOURCE_DIR)/overview.edoc.in
 	mkdir -p $(DOC_DIR)
@@ -160,6 +153,36 @@ $(DOC_DIR)/index.html: $(COMPILE_DEPS) $(DOC_DIR)/overview.edoc $(SOURCES)
 	$(LIBS_PATH) erl -noshell -eval 'edoc:application(amqp_client, ".", [{preprocess, true}])' -run init stop
 
 doc: $(DOC_DIR)/index.html
+
+###############################################################################
+## Dialyzer
+###############################################################################
+
+dialyze: compile compile_tests $(BROKER_PLT) $(PLT) .last_valid_dialysis
+
+create_plt: compile compile_tests $(BROKER_PLT) $(PLT)
+
+$(PLT): $(TARGETS) $(TEST_TARGETS)
+	$(MAKE) -C $(BROKER_DIR) ebin/rabbit_dialyzer.beam
+	if [ -f $@ -a $(BROKER_PLT) -ot $@ ]; then \
+	    DIALYZER_INPUT_FILES="$?"; \
+	else \
+	    cp $(BROKER_PLT) $@ && \
+		rm -f .last_valid_dialysis && \
+	    DIALYZER_INPUT_FILES="$(TARGETS) $(TEST_TARGETS)"; \
+	fi; \
+	$(ERL_RABBIT_DIALYZER) -eval \
+	    "rabbit_dialyzer:update_plt(\"$@\", \"$$DIALYZER_INPUT_FILES\"), halt()."
+
+.last_valid_dialysis: $(TARGETS) $(TEST_TARGETS)
+	$(MAKE) -C $(BROKER_DIR) ebin/rabbit_dialyzer.beam
+	$(ERL_RABBIT_DIALYZER) -eval \
+	    "rabbit_dialyzer:dialyze_files(\"$(PLT)\", \"$?\"), halt()." && \
+	touch $@
+
+.PHONY: $(BROKER_PLT)
+$(BROKER_PLT):
+	$(MAKE) -C $(BROKER_DIR) create-plt
 
 ###############################################################################
 ##  Packaging
@@ -187,11 +210,11 @@ $(COMPILE_DEPS): $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
 $(EBIN_DIR)/%.beam: $(SOURCE_DIR)/%.erl $(INCLUDES) $(COMPILE_DEPS)
 	$(LIBS_PATH) erlc $(ERLC_OPTS) $<
 
-$(TEST_DIR)/%.beam: compile_tests
+$(TEST_DIR)/%.beam: $(TEST_DIR)
 
-$(BROKER_DIR):
-	test -e $(BROKER_DIR)
-	$(MAKE_BROKER)
+.PHONY: $(TEST_DIR)
+$(TEST_DIR): $(COMPILE_DEPS)
+	$(MAKE) -C $(TEST_DIR)
 
 $(DIST_DIR):
 	mkdir -p $@
