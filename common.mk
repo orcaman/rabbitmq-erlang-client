@@ -61,13 +61,15 @@ DEPS=$(shell erl -noshell -eval '{ok,[{_,_,[_,_,{modules, Mods},_,_,_]}]} = \
                                  [io:format("~p ",[M]) || M <- Mods], halt().')
 
 PACKAGE=amqp_client
-PACKAGE_NAME=$(PACKAGE).ez
+PACKAGE_VSN=$(PACKAGE)-$(VERSION)
+PACKAGE_NAME=$(PACKAGE_VSN).ez
 COMMON_PACKAGE=rabbit_common
-COMMON_PACKAGE_NAME=$(COMMON_PACKAGE).ez
+COMMON_PACKAGE_VSN=$(COMMON_PACKAGE)-$(VERSION)
+COMMON_PACKAGE_NAME=$(COMMON_PACKAGE_VSN).ez
 
-COMPILE_DEPS=$(DEPS_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)/rabbit.hrl \
-             $(DEPS_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)/rabbit_framing.hrl \
-             $(DEPS_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR)
+COMPILE_DEPS=$(DEPS_DIR)/$(COMMON_PACKAGE_VSN)/$(INCLUDE_DIR)/rabbit.hrl \
+             $(DEPS_DIR)/$(COMMON_PACKAGE_VSN)/$(INCLUDE_DIR)/rabbit_framing.hrl \
+             $(DEPS_DIR)/$(COMMON_PACKAGE_VSN)/$(EBIN_DIR)
 
 INCLUDES=$(wildcard $(INCLUDE_DIR)/*.hrl)
 SOURCES=$(wildcard $(SOURCE_DIR)/*.erl)
@@ -75,10 +77,8 @@ TARGETS=$(patsubst $(SOURCE_DIR)/%.erl, $(EBIN_DIR)/%.beam, $(SOURCES))
 TEST_SOURCES=$(wildcard $(TEST_DIR)/*.erl)
 TEST_TARGETS=$(patsubst $(TEST_DIR)/%.erl, $(TEST_DIR)/%.beam, $(TEST_SOURCES))
 
-BROKER_HEADERS=$(wildcard $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl) \
-               $(BROKER_DIR)/$(INCLUDE_DIR)/rabbit_framing.hrl
-BROKER_SOURCES=$(wildcard $(BROKER_DIR)/$(SOURCE_DIR)/*.erl) \
-               $(BROKER_DIR)/$(SOURCE_DIR)/rabbit_framing.erl
+BROKER_HEADERS=$(wildcard $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl)
+BROKER_SOURCES=$(wildcard $(BROKER_DIR)/$(SOURCE_DIR)/*.erl)
 
 LIBS_PATH=ERL_LIBS=$(DEPS_DIR):$(DIST_DIR)
 LOAD_PATH=$(EBIN_DIR) $(BROKER_DIR)/ebin $(TEST_DIR)
@@ -90,10 +90,10 @@ MKTEMP=$$(mktemp $(TMPDIR)/tmp.XXXXXXXXXX)
 
 ifndef USE_SPECS
 # our type specs rely on features / bug fixes in dialyzer that are
-# only available in R13B upwards (R13B is eshell 5.7.1)
+# only available in R12B-3 upwards
 #
 # NB: the test assumes that version number will only contain single digits
-export USE_SPECS=$(shell if [ $$(erl -noshell -eval 'io:format(erlang:system_info(version)), halt().') \> "5.7.0" ]; then echo "true"; else echo "false"; fi)
+export USE_SPECS=$(shell if [ $$(erl -noshell -eval 'io:format(erlang:system_info(version)), halt().') \> "5.6.2" ]; then echo "true"; else echo "false"; fi)
 endif
 
 ERLC_OPTS=-I $(INCLUDE_DIR) -o $(EBIN_DIR) -Wall -v +debug_info $(shell [ $(USE_SPECS) = "true" ] && echo "-Duse_specs")
@@ -116,18 +116,15 @@ ALL_SSL_COVERAGE := true
 SSL_BROKER_ARGS :=
 endif
 
-PLT=rabbitmq-erlang-client.plt
-BROKER_PLT=$(BROKER_DIR)/rabbit.plt
-RABBIT_DIALYZER_SOURCE=src/rabbit_dialyzer.erl
-RABBIT_DIALYZER=ebin/rabbit_dialyzer
-RABBIT_DIALYZER_BEAM=$(RABBIT_DIALYZER).beam
-ERL_RABBIT_DIALYZER=erl -noinput -eval "code:load_abs(\"$(BROKER_DIR)/$(RABBIT_DIALYZER)\")."
+PLT=$(HOME)/.dialyzer_plt
+DIALYZER_CALL=dialyzer --plt $(PLT)
 
-.PHONY: all compile compile_tests run run_in_broker dialyze create_plt \
-	prepare_tests all_tests test_suites test_suites_coverage run_test_broker \
-	start_test_broker_node stop_test_broker_node test_network test_direct \
-	test_network_coverage test_direct_coverage test_common_package clean \
-	source_tarball package boot_broker unboot_broker
+.PHONY: all compile compile_tests run run_in_broker dialyzer dialyze_all \
+	add_broker_to_plt prepare_tests all_tests test_suites \
+	test_suites_coverage run_test_broker start_test_broker_node \
+	stop_test_broker_node test_network test_direct test_network_coverage \
+	test_direct_coverage test_common_package clean source_tarball package \
+	boot_broker unboot_broker
 
 all: package
 
@@ -135,18 +132,32 @@ common_clean:
 	rm -f $(EBIN_DIR)/*.beam
 	rm -f erl_crash.dump
 	rm -fr $(DOC_DIR)
-	rm -f $(PLT) .last_valid_dialysis
 	$(MAKE) -C $(TEST_DIR) clean
 
 compile: $(TARGETS)
 
-compile_tests: $(TEST_TARGETS)
+<<<<<<< local
+compile_tests: $(TEST_DIR) $(COMPILE_DEPS)
+	$(MAKE) -C $(TEST_DIR) VERSION=$(VERSION)
+=======
+compile_tests: $(TEST_DIR) $(COMPILE_DEPS) $(EBIN_DIR)/$(PACKAGE).app
+	$(MAKE) -C $(TEST_DIR)
+>>>>>>> other
 
 run: compile $(EBIN_DIR)/$(PACKAGE).app
 	erl -pa $(LOAD_PATH)
 
 run_in_broker: compile $(BROKER_DIR) $(EBIN_DIR)/$(PACKAGE).app
 	$(MAKE) RABBITMQ_SERVER_START_ARGS='$(PA_LOAD_PATH)' -C $(BROKER_DIR) run
+
+dialyze: $(TARGETS)
+	$(DIALYZER_CALL) -c $^
+
+dialyze_all: $(TARGETS) $(TEST_TARGETS)
+	$(DIALYZER_CALL) -c $^
+
+add_broker_to_plt: $(BROKER_DIR)/ebin
+	$(DIALYZER_CALL) --add_to_plt -r $<
 
 $(DOC_DIR)/overview.edoc: $(SOURCE_DIR)/overview.edoc.in
 	mkdir -p $(DOC_DIR)
@@ -158,38 +169,17 @@ $(DOC_DIR)/index.html: $(COMPILE_DEPS) $(DOC_DIR)/overview.edoc $(SOURCES)
 doc: $(DOC_DIR)/index.html
 
 ###############################################################################
-## Dialyzer
-###############################################################################
-
-dialyze: .last_valid_dialysis
-
-create_plt: $(PLT)
-
-$(PLT): $(TARGETS) $(TEST_TARGETS) $(BROKER_PLT) $(BROKER_DIR)/$(RABBIT_DIALYZER_BEAM)
-	test -f $@ -a $(BROKER_PLT) -ot $@ || cp $(BROKER_PLT) $@
-	$(ERL_RABBIT_DIALYZER) -eval \
-	    "rabbit_dialyzer:update_plt(\"$@\", \"$(strip $(TARGETS) $(TEST_TARGETS))\"), halt()."
-
-.last_valid_dialysis: $(TARGETS) $(TEST_TARGETS) $(PLT) $(BROKER_DIR)/$(RABBIT_DIALYZER_BEAM)
-	if [ $(PLT) -ot $@ ]; then \
-	    DIALYZER_INPUT_FILES="$(filter %.beam, $?)"; \
-	else \
-	    DIALYZER_INPUT_FILES="$(strip $(TARGETS) $(TEST_TARGETS))"; \
-	fi; \
-	$(ERL_RABBIT_DIALYZER) -eval \
-	    "rabbit_dialyzer:dialyze_files(\"$(PLT)\", \"$$DIALYZER_INPUT_FILES\"), halt()." && \
-	touch $@
-
-$(BROKER_DIR)/$(RABBIT_DIALYZER_BEAM): $(BROKER_DIR)/$(RABBIT_DIALYZER_SOURCE)
-	$(MAKE) -C $(BROKER_DIR) $(RABBIT_DIALYZER_BEAM)
-
-$(BROKER_PLT): $(BROKER_HEADERS) $(BROKER_SOURCES)
-	$(MAKE) -C $(BROKER_DIR) create-plt
-
-###############################################################################
 ##  Packaging
 ###############################################################################
 
+<<<<<<< local
+$(DIST_DIR)/$(PACKAGE_NAME): $(TARGETS)
+	rm -rf $(DIST_DIR)/$(PACKAGE_VSN)
+	mkdir -p $(DIST_DIR)/$(PACKAGE_VSN)
+	cp -r $(EBIN_DIR) $(DIST_DIR)/$(PACKAGE_VSN)
+	cp -r $(INCLUDE_DIR) $(DIST_DIR)/$(PACKAGE_VSN)
+	(cd $(DIST_DIR); zip -r $(PACKAGE_NAME) $(PACKAGE_VSN))
+=======
 $(DIST_DIR)/$(PACKAGE_NAME): $(TARGETS) $(EBIN_DIR)/$(PACKAGE).app
 	rm -rf $(DIST_DIR)/$(PACKAGE)
 	mkdir -p $(DIST_DIR)/$(PACKAGE)/$(EBIN_DIR)
@@ -198,6 +188,7 @@ $(DIST_DIR)/$(PACKAGE_NAME): $(TARGETS) $(EBIN_DIR)/$(PACKAGE).app
 	mkdir -p $(DIST_DIR)/$(PACKAGE)/$(INCLUDE_DIR)
 	cp -r $(INCLUDE_DIR)/* $(DIST_DIR)/$(PACKAGE)/$(INCLUDE_DIR)
 	(cd $(DIST_DIR); zip -r $(PACKAGE_NAME) $(PACKAGE))
+>>>>>>> other
 
 package: $(DIST_DIR)/$(PACKAGE_NAME)
 
@@ -209,15 +200,14 @@ $(COMPILE_DEPS): $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
 	mkdir -p $(DEPS_DIR)
 	unzip -o -d $(DEPS_DIR) $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
 
-$(EBIN_DIR)/%.beam: $(SOURCE_DIR)/%.erl $(INCLUDES) $(COMPILE_DEPS)
+$(EBIN_DIR)/%.beam: $(SOURCE_DIR)/%.erl $(INCLUDES) $(COMPILE_DEPS) $(INCLUDE_DIR)/version.hrl
 	$(LIBS_PATH) erlc $(ERLC_OPTS) $<
 
-$(TEST_DIR)/%.beam: $(TEST_DIR)
-	
+$(TEST_DIR)/%.beam: compile_tests
 
-.PHONY: $(TEST_DIR)
-$(TEST_DIR): $(COMPILE_DEPS) $(EBIN_DIR)/$(PACKAGE).app
-	$(MAKE) -C $(TEST_DIR)
+$(BROKER_DIR):
+	test -e $(BROKER_DIR)
+	$(MAKE_BROKER)
 
 $(DIST_DIR):
 	mkdir -p $@
