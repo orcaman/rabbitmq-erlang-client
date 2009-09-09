@@ -178,10 +178,18 @@ start_ok(#connection_state{username = Username, password = Password}) ->
     #'connection.start_ok'{
            client_properties = [
                             {<<"product">>,   longstr, <<"RabbitMQ">>},
+<<<<<<< local
+                            {<<"version">>,   longstr, ?VERSION},
+=======
                             {<<"version">>,   longstr, list_to_binary(Vsn)},
+>>>>>>> other
                             {<<"platform">>,  longstr, <<"Erlang">>},
                             {<<"copyright">>, longstr,
+<<<<<<< local
+                             <<"Copyright (C) 2007-2008 LShift Ltd., "
+=======
                              <<"Copyright (C) 2007-2009 LShift Ltd., "
+>>>>>>> other
                                "Cohesive Financial Technologies LLC., "
                                "and Rabbit Technologies Ltd.">>},
                             {<<"information">>, longstr,
