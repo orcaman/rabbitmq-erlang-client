@@ -40,6 +40,7 @@
 -export([call/2, call/3, cast/2, cast/3]).
 -export([subscribe/3]).
 -export([close/1, close/3]).
+-export([register_direct_peer/2]).
 -export([register_return_handler/2]).
 -export([register_flow_handler/2]).
 
@@ -184,6 +185,21 @@ register_flow_handler(Channel, FlowHandler) ->
     gen_server:cast(Channel, {register_flow_handler, FlowHandler} ).
 
 %%---------------------------------------------------------------------------
+%% Direct peer registration
+%%---------------------------------------------------------------------------
+
+%% @private
+%% Registers the direct channel peer with the state of this channel.
+%% This registration occurs after the amqp_channel gen_server instance
+%% because the pid of this amqp_channel needs to be passed into the
+%% initialization of that direct channel process, hence the resulting
+%% direct channel pid can only be post-registered.
+%% Have another look at this: This is also being used to register a writer
+%% pid in the network case as well.........code reuse ;-)
+register_direct_peer(Channel, Peer) ->
+    gen_server:cast(Channel, {register_direct_peer, Peer} ).
+
+%%---------------------------------------------------------------------------
 %% Internal plumbing
 %%---------------------------------------------------------------------------
 
@@ -191,38 +207,40 @@ rpc_top_half(Method, From, State) ->
     rpc_top_half(Method, undefined, From, State).
 
 rpc_top_half(Method, Content, From, 
-             State = #channel_state{rpc_requests = RequestQueue}) ->
+             State = #channel_state{writer_pid = Writer,
+                                    rpc_requests = RequestQueue,
+                                    do2 = Do2,
+                                    do3 = Do3}) ->
     % Enqueue the incoming RPC request to serialize RPC dispatching
-    NewState = State#channel_state{
-        rpc_requests = queue:in({From, Method, Content}, RequestQueue)},
-    IsFirstElement = queue:is_empty(RequestQueue),
-    if IsFirstElement -> do_rpc(NewState);
-       true           -> ok
-    end,
+    NewRequestQueue = queue:in({From, Method}, RequestQueue),
+    NewState = State#channel_state{rpc_requests = NewRequestQueue},
+    case queue:len(NewRequestQueue) of
+        1 ->
+            case Content of
+                undefined -> Do2(Writer, Method);
+                _         -> Do3(writer, Method, Content)
+            end;
+        _ ->
+            ok
+        end,
     {noreply, NewState}.
 
-rpc_bottom_half(Reply, State = #channel_state{rpc_requests = RequestQueue}) ->
-    case queue:out(RequestQueue) of
-        {empty, _} ->
-            exit(empty_rpc_bottom_half);
-        {{value, {From, _Method, _Content}}, NewRequestQueue} ->
-            gen_server:reply(From, Reply),
-            NewState = State#channel_state{rpc_requests = NewRequestQueue},
-            do_rpc(NewState),
-            {noreply, NewState}
-    end.
+rpc_bottom_half(Reply, State = #channel_state{writer_pid = Writer,
+                                              rpc_requests = RequestQueue,
+                                              do2 = Do2}) ->
+    NewRequestQueue =
+        case queue:out(RequestQueue) of
+            {empty, _}              -> exit(empty_rpc_bottom_half);
+            {{value, {From, _}}, Q} -> gen_server:reply(From, Reply),
+                                       Q
+        end,
+    case queue:is_empty(NewRequestQueue) of
+        true  -> ok;
+        false -> {_NewFrom, Method} = queue:head(NewRequestQueue),
+                 Do2(Writer, Method)
+    end,
+    {noreply, State#channel_state{rpc_requests = NewRequestQueue}}.
 
-do_rpc(#channel_state{writer_pid = Writer,
-                      rpc_requests = RequestQueue,
-                      driver = Driver}) ->
-    case queue:peek(RequestQueue) of
-        {value, {_From, Method, undefined}} ->
-            Driver:do(Writer, Method);
-        {value, {_From, Method, Content}} ->
-            Driver:do(Writer, Method, Content);
-        empty ->
-            empty
-    end.
 
 resolve_consumer(_ConsumerTag, #channel_state{consumers = []}) ->
     exit(no_consumers_registered);
@@ -239,6 +257,11 @@ unregister_consumer(ConsumerTag,
                     State = #channel_state{consumers = Consumers0}) ->
     Consumers1 = dict:erase(ConsumerTag, Consumers0),
     State#channel_state{consumers = Consumers1}.
+
+shutdown_writer(State = #channel_state{close_fun  = CloseFun,
+                                       writer_pid = WriterPid}) ->
+    CloseFun(WriterPid),
+    State.
 
 return_handler(State = #channel_state{return_handler_pid = undefined}) ->
     %% TODO what about trapping exits??
@@ -288,9 +311,9 @@ handle_method(CloseOk = #'channel.close_ok'{}, State) ->
 %% Handles the scenario when the broker intiates a channel.close
 handle_method(#'channel.close'{reply_code = ReplyCode,
                                reply_text = ReplyText},
-              State = #channel_state{driver = Driver,
+              State = #channel_state{do2 = Do2,
                                      writer_pid = Writer}) ->
-    Driver:do(Writer, #'channel.close_ok'{}),
+    Do2(Writer, #'channel.close_ok'{}),
     {stop, {server_initiated_close, ReplyCode, ReplyText}, State};
 
 %% This handles the flow control flag that the broker initiates.
@@ -298,13 +321,13 @@ handle_method(#'channel.close'{reply_code = ReplyCode,
 %% any content bearing methods
 handle_method(Flow = #'channel.flow'{active = Active},
               State = #channel_state{writer_pid = Writer,
-                                     driver = Driver,
+                                     do2 = Do2,
                                      flow_handler_pid = FlowHandler}) ->
     case FlowHandler of
         undefined -> ok;
         _ -> FlowHandler ! Flow
     end,
-    Driver:do(Writer, #'channel.flow_ok'{active = Active}),
+    Do2(Writer, #'channel.flow_ok'{active = Active}),
     {noreply, State#channel_state{flow_control = not(Active)}};
 
 handle_method(Method, State) ->
@@ -333,12 +356,8 @@ handle_method(Method, Content, State) ->
 %% gen_server callbacks
 %%---------------------------------------------------------------------------
 %% @private
-init({ChannelState = #channel_state{driver = Driver, number = ChannelNumber},
-      ConnectionState}) ->
-    process_flag(trap_exit, true),
-    {WriterPid, ReaderPid} = Driver:open_channel(ChannelNumber, ConnectionState),
-    {ok, ChannelState#channel_state{writer_pid = WriterPid,
-                                    reader_pid = ReaderPid}}.
+init([InitialState]) ->
+    {ok, InitialState}.
 
 %% Standard implementation of top half of the call/2 command
 %% Do not accept any further RPCs when the channel is about to close
@@ -352,12 +371,12 @@ handle_call({call, Method = #'channel.close'{}}, From, State) ->
 
 %% @private
 handle_call({call, Method}, From, State = #channel_state{writer_pid = Writer,
-                                                         driver = Driver}) ->
+                                                         do2 = Do2}) ->
     case rabbit_framing:is_method_synchronous(Method) of
         true  ->
             rpc_top_half(Method, From, State);
         false ->
-            Driver:do(Writer, Method),
+            Do2(Writer, Method),
             {reply, ok, State}
     end;
 
@@ -368,14 +387,13 @@ handle_call({call, _Method, _Content}, _From,
 
 %% @private
 handle_call({call, Method, #amqp_msg{props = Props, payload = Payload}},
-            From, State = #channel_state{writer_pid = Writer,
-                                         driver = Driver}) ->
+            From, State = #channel_state{writer_pid = Writer, do3 = Do3}) ->
     Content = rabbit_basic:build_content(Props, Payload),
     case rabbit_framing:is_method_synchronous(Method) of
         true  ->
             rpc_top_half(Method, Content, From, State);
         false ->
-            Driver:do(Writer, Method, Content),
+            Do3(Writer, Method, Content),
             {reply, ok, State}
     end;
 
@@ -409,8 +427,8 @@ handle_cast({cast, _Method}, State = #channel_state{closing = true}) ->
 %% Standard implementation of the cast/2 command
 %% @private
 handle_cast({cast, Method}, State = #channel_state{writer_pid = Writer,
-                                                   driver = Driver}) ->
-    Driver:do(Writer, Method),
+                                                   do2 = Do2}) ->
+    Do2(Writer, Method),
     {noreply, State};
 
 %% This discards any message submitted to the channel when flow control is
@@ -431,9 +449,17 @@ handle_cast({cast, _Method, _Content}, State = #channel_state{closing = true}) -
 %% Standard implementation of the cast/3 command
 %% @private
 handle_cast({cast, Method, #amqp_msg{props = Props, payload = Payload}},
-            State = #channel_state{writer_pid = Writer, driver = Driver}) ->
-    Driver:do(Writer, Method, rabbit_basic:build_content(Props, Payload)),
+            State = #channel_state{writer_pid = Writer, do3 = Do3}) ->
+    Do3(Writer, Method, rabbit_basic:build_content(Props, Payload)),
     {noreply, State};
+
+%% Registers the direct channel peer when using the direct client
+%% @private
+handle_cast({register_direct_peer, Peer}, State) ->
+    link(Peer),
+    process_flag(trap_exit, true),
+    NewState = State#channel_state{writer_pid = Peer},
+    {noreply, NewState};
 
 %% Registers a handler to process return messages
 %% @private
@@ -458,11 +484,11 @@ handle_cast({notify_sent, _Peer}, State) ->
 %%---------------------------------------------------------------------------
 
 %% @private
-handle_cast({method, Method, none}, State) ->
+handle_cast( {method, Method, none}, State) ->
     handle_method(Method, State);
 
 %% @private
-handle_cast({method, Method, Content}, State) ->
+handle_cast( {method, Method, Content}, State) ->
     handle_method(Method, Content, State).
 
 %%---------------------------------------------------------------------------
@@ -472,11 +498,11 @@ handle_cast({method, Method, Content}, State) ->
 %%---------------------------------------------------------------------------
 
 %% @private
-handle_info({send_command, Method}, State) ->
+handle_info( {send_command, Method}, State) ->
     handle_method(Method, State);
 
 %% @private
-handle_info({send_command, Method, Content}, State) ->
+handle_info( {send_command, Method, Content}, State) ->
     handle_method(Method, Content, State);
 
 %% @private
@@ -485,37 +511,24 @@ handle_info(shutdown, State) ->
 
 %% Handles the delivery of a message from a direct channel
 %% @private
-handle_info({send_command_and_notify, Q, ChPid, Method, Content}, State) ->
+handle_info( {send_command_and_notify, Q, ChPid, Method, Content}, State) ->
     handle_method(Method, Content, State),
     rabbit_amqqueue:notify_sent(Q, ChPid),
     {noreply, State};
 
-
-%% Handle writer exit
+%% This is sent by the the process that writes to the socket
+%% on a per channel basis. This occurs when the reader process
+%% exits because the server has closed the socket. In this event,
+%% because the channel process is linked to the reader process,
+%% the channel will receive a notification. However, it is a matter
+%% of scheduling as to whether this process receives this EXIT message
+%% before the EXIT message that will receive from the connection
+%% process which will handle the connection.close from the broker.
+%% TODO Look into why the channel process needs to link to the
+%% reader process in the network case.
 %% @private
-handle_info({'EXIT', WriterPid, Reason},
-            State = #channel_state{number = ChannelNumber,
-                                   writer_pid = WriterPid}) ->
-    ?LOG_WARN("Channel ~p closing: received exit signal from writer. "
-              "Reason: ~p~n", [ChannelNumber, Reason]),
-    {stop, {writer_died, WriterPid, Reason}, State};
-
-%% Handle reader exit
-%% @private
-handle_info({'EXIT', ReaderPid, Reason},
-            State = #channel_state{number = ChannelNumber,
-                                   reader_pid = ReaderPid}) ->
-    ?LOG_WARN("Channel ~p closing: received exit signal from reader. "
-              "Reason: ~p~n", [ChannelNumber, Reason]),
-    {stop, {reader_died, ReaderPid, Reason}, State};
-
-%% Handle other exit
-%% @private
-handle_info({'EXIT', Pid, Reason},
-            State = #channel_state{number = ChannelNumber}) ->
-    ?LOG_WARN("Channel ~p closing: received unexpected exit signal from (~p). "
-              "Reason: ~p~n", [ChannelNumber, Pid, Reason]),
-    {stop, {unexpected_exit, Pid, Reason}, State};
+handle_info({'EXIT', _Pid, connection_socket_closed_unexpectedly}, State) ->
+    {noreply, State};
 
 %% This is for a channel exception that is sent by the direct
 %% rabbit_channel process - in this case this process needs to tell
@@ -535,11 +548,11 @@ handle_info({channel_exit, _Channel, {amqp, Reason, _Msg, _Context}},
 %%---------------------------------------------------------------------------
 
 %% @private
-terminate(Reason, #channel_state{driver = Driver,
-                                 writer_pid = WriterPid,
-                                 reader_pid = ReaderPid}) ->
-    Driver:close_channel(Reason, WriterPid, ReaderPid).
+terminate(_Reason, State) ->
+    shutdown_writer(State),
+    ok.
 
 %% @private
 code_change(_OldVsn, State, _Extra) ->
     State.
+

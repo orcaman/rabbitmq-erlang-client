@@ -61,13 +61,15 @@ DEPS=$(shell erl -noshell -eval '{ok,[{_,_,[_,_,{modules, Mods},_,_,_]}]} = \
                                  [io:format("~p ",[M]) || M <- Mods], halt().')
 
 PACKAGE=amqp_client
-PACKAGE_NAME=$(PACKAGE).ez
+PACKAGE_VSN=$(PACKAGE)-$(VERSION)
+PACKAGE_NAME=$(PACKAGE_VSN).ez
 COMMON_PACKAGE=rabbit_common
-COMMON_PACKAGE_NAME=$(COMMON_PACKAGE).ez
+COMMON_PACKAGE_VSN=$(COMMON_PACKAGE)-$(VERSION)
+COMMON_PACKAGE_NAME=$(COMMON_PACKAGE_VSN).ez
 
-COMPILE_DEPS=$(DEPS_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)/rabbit.hrl \
-             $(DEPS_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)/rabbit_framing.hrl \
-             $(DEPS_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR)
+COMPILE_DEPS=$(DEPS_DIR)/$(COMMON_PACKAGE_VSN)/$(INCLUDE_DIR)/rabbit.hrl \
+             $(DEPS_DIR)/$(COMMON_PACKAGE_VSN)/$(INCLUDE_DIR)/rabbit_framing.hrl \
+             $(DEPS_DIR)/$(COMMON_PACKAGE_VSN)/$(EBIN_DIR)
 
 INCLUDES=$(wildcard $(INCLUDE_DIR)/*.hrl)
 SOURCES=$(wildcard $(SOURCE_DIR)/*.erl)
@@ -88,10 +90,10 @@ MKTEMP=$$(mktemp $(TMPDIR)/tmp.XXXXXXXXXX)
 
 ifndef USE_SPECS
 # our type specs rely on features / bug fixes in dialyzer that are
-# only available in R13B upwards (R13B is eshell 5.7.1)
+# only available in R12B-3 upwards
 #
 # NB: the test assumes that version number will only contain single digits
-export USE_SPECS=$(shell if [ $$(erl -noshell -eval 'io:format(erlang:system_info(version)), halt().') \> "5.7.0" ]; then echo "true"; else echo "false"; fi)
+export USE_SPECS=$(shell if [ $$(erl -noshell -eval 'io:format(erlang:system_info(version)), halt().') \> "5.6.2" ]; then echo "true"; else echo "false"; fi)
 endif
 
 ERLC_OPTS=-I $(INCLUDE_DIR) -o $(EBIN_DIR) -Wall -v +debug_info $(shell [ $(USE_SPECS) = "true" ] && echo "-Duse_specs")
@@ -134,8 +136,13 @@ common_clean:
 
 compile: $(TARGETS)
 
+<<<<<<< local
+compile_tests: $(TEST_DIR) $(COMPILE_DEPS)
+	$(MAKE) -C $(TEST_DIR) VERSION=$(VERSION)
+=======
 compile_tests: $(TEST_DIR) $(COMPILE_DEPS) $(EBIN_DIR)/$(PACKAGE).app
 	$(MAKE) -C $(TEST_DIR)
+>>>>>>> other
 
 run: compile $(EBIN_DIR)/$(PACKAGE).app
 	erl -pa $(LOAD_PATH)
@@ -165,6 +172,14 @@ doc: $(DOC_DIR)/index.html
 ##  Packaging
 ###############################################################################
 
+<<<<<<< local
+$(DIST_DIR)/$(PACKAGE_NAME): $(TARGETS)
+	rm -rf $(DIST_DIR)/$(PACKAGE_VSN)
+	mkdir -p $(DIST_DIR)/$(PACKAGE_VSN)
+	cp -r $(EBIN_DIR) $(DIST_DIR)/$(PACKAGE_VSN)
+	cp -r $(INCLUDE_DIR) $(DIST_DIR)/$(PACKAGE_VSN)
+	(cd $(DIST_DIR); zip -r $(PACKAGE_NAME) $(PACKAGE_VSN))
+=======
 $(DIST_DIR)/$(PACKAGE_NAME): $(TARGETS) $(EBIN_DIR)/$(PACKAGE).app
 	rm -rf $(DIST_DIR)/$(PACKAGE)
 	mkdir -p $(DIST_DIR)/$(PACKAGE)/$(EBIN_DIR)
@@ -173,6 +188,7 @@ $(DIST_DIR)/$(PACKAGE_NAME): $(TARGETS) $(EBIN_DIR)/$(PACKAGE).app
 	mkdir -p $(DIST_DIR)/$(PACKAGE)/$(INCLUDE_DIR)
 	cp -r $(INCLUDE_DIR)/* $(DIST_DIR)/$(PACKAGE)/$(INCLUDE_DIR)
 	(cd $(DIST_DIR); zip -r $(PACKAGE_NAME) $(PACKAGE))
+>>>>>>> other
 
 package: $(DIST_DIR)/$(PACKAGE_NAME)
 
@@ -184,7 +200,7 @@ $(COMPILE_DEPS): $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
 	mkdir -p $(DEPS_DIR)
 	unzip -o -d $(DEPS_DIR) $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
 
-$(EBIN_DIR)/%.beam: $(SOURCE_DIR)/%.erl $(INCLUDES) $(COMPILE_DEPS)
+$(EBIN_DIR)/%.beam: $(SOURCE_DIR)/%.erl $(INCLUDES) $(COMPILE_DEPS) $(INCLUDE_DIR)/version.hrl
 	$(LIBS_PATH) erlc $(ERLC_OPTS) $<
 
 $(TEST_DIR)/%.beam: compile_tests
