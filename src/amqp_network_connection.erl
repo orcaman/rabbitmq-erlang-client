@@ -315,45 +315,15 @@ handle_exit(MainReaderPid, Reason,
 
 %% Handle exit from channel or other pid
 handle_exit(Pid, Reason,
-            #nc_state{channels = Channels} = State) ->
-    case amqp_channel_util:is_channel_pid_registered(Pid, Channels) of
-        true  -> handle_channel_exit(Pid, Reason, State);
-        false -> handle_other_pid_exit(Pid, Reason, State)
+            #nc_state{channels = Channels, closing = Closing} = State) ->
+    case amqp_channel_util:handle_exit(Pid, Reason, Channels, Closing) of
+        stop   -> {stop, Reason, State};
+        normal -> {noreply, unregister_channel(Pid, State)};
+        close  -> {noreply, set_closing_state(abrupt, internal_error_closing(),
+                                              unregister_channel(Pid, State))};
+        other  -> {noreply, set_closing_state(abrupt, internal_error_closing(),
+                                              State)}
     end.
-
-%% Handle channel exit
-handle_channel_exit(Pid, Reason, #nc_state{closing = Closing} = State) ->
-    case Reason of
-        %% Normal amqp_channel shutdown
-        normal ->
-            {noreply, unregister_channel(Pid, State)};
-        %% Channel terminating (server sent 'channel.close')
-        {server_initiated_close, Code, _Text} = Msg when Closing =:= false ->
-            case rabbit_framing:is_amqp_hard_error_code(Code) of
-                true  -> ?LOG_WARN("Connection (~p) closing: channel (~p) " 
-                                   "received hard error from server~n",
-                                   [self(), Pid]),
-                         {stop, Msg, State};
-                false -> {noreply, unregister_channel(Pid, State)}
-            end;
-        %% Channel terminating because of connection_closing
-        {_Reason, _Code, _Text} when Closing =/= false ->
-            {noreply, unregister_channel(Pid, State)};
-        %% amqp_channel dies with internal reason - this takes the entire
-        %% connection down
-        _ ->
-            ?LOG_WARN("Connection (~p) closing: channel (~p) died. Reason: ~p~n",
-                      [self(), Pid, Reason]),
-            State1 = unregister_channel(Pid, State),
-            State2 = set_closing_state(abrupt, internal_error_closing(), State1),
-            {noreply, State2}
-    end.
-
-%% Handle other pid exit
-handle_other_pid_exit(Pid, Reason, State) ->
-    ?LOG_WARN("Connection (~p) closing: received unexpected exit signal "
-              "from (~p). Reason: ~p~n", [self(), Pid, Reason]),
-    {noreply, set_closing_state(abrupt, internal_error_closing(), State)}.
 
 %%---------------------------------------------------------------------------
 %% Handshake
@@ -402,28 +372,48 @@ do_handshake(State0 = #nc_state{sock = Sock}) ->
 
 network_handshake(State = #nc_state{channel0_writer_pid = Writer0,
                                     params = Params}) ->
-    #'connection.start'{} = handshake_recv(State),
+    Start = handshake_recv(State),
+    ok = check_version(Start),
     amqp_channel_util:do(network, Writer0, start_ok(State), none),
-    #'connection.tune'{channel_max = ChannelMax,
-                       frame_max = FrameMax,
-                       heartbeat = Heartbeat} = handshake_recv(State),
-    TuneOk = #'connection.tune_ok'{channel_max = ChannelMax,
-                                   frame_max = FrameMax,
-                                   heartbeat = Heartbeat},
+    Tune = handshake_recv(State),
+    TuneOk = negotiate_values(Tune, Params),
     amqp_channel_util:do(network, Writer0, TuneOk, none),
-    %% This is something where I don't understand the protocol,
-    %% What happens if the following command reaches the server
-    %% before the tune ok?
-    %% Or doesn't get sent at all?
     ConnectionOpen =
-        #'connection.open'{virtual_host = Params#amqp_params.virtual_host},
+        #'connection.open'{virtual_host = Params#amqp_params.virtual_host,
+                           insist = true},
     amqp_channel_util:do(network, Writer0, ConnectionOpen, none),
+    %% 'connection.redirect' not implemented (we use insist = true to cover)
     #'connection.open_ok'{} = handshake_recv(State),
-    %% TODO What should I do with the KnownHosts?
-    MaxChannelNumber = if ChannelMax =:= 0 -> ?MAX_CHANNEL_NUMBER;
-                          true             -> ChannelMax
-                       end,
-    State#nc_state{max_channel = MaxChannelNumber, heartbeat = Heartbeat}.
+    #'connection.tune_ok'{channel_max = ChannelMax,
+                          frame_max   = FrameMax,
+                          heartbeat   = Heartbeat} = TuneOk,
+    ?LOG_INFO("Negotiated maximums: (Channel = ~p, "
+              "Frame= ~p, Heartbeat=~p)~n",
+             [ChannelMax, FrameMax, Heartbeat]),
+    State#nc_state{max_channel = ChannelMax, heartbeat = Heartbeat}.
+
+check_version(#'connection.start'{version_major = ?PROTOCOL_VERSION_MAJOR,
+                                  version_minor = ?PROTOCOL_VERSION_MINOR}) ->
+    ok;
+check_version(#'connection.start'{version_major = Major,
+                                  version_minor = Minor}) ->
+    exit({protocol_version_mismatch, Major, Minor}).
+
+negotiate_values(#'connection.tune'{channel_max = ServerChannelMax,
+                                    frame_max   = ServerFrameMax,
+                                    heartbeat   = ServerHeartbeat},
+                 #amqp_params{channel_max = ClientChannelMax,
+                              frame_max   = ClientFrameMax,
+                              heartbeat   = ClientHeartbeat}) ->
+    #'connection.tune_ok'{
+        channel_max = negotiate_max_value(ClientChannelMax, ServerChannelMax),
+        frame_max   = negotiate_max_value(ClientFrameMax, ServerFrameMax),
+        heartbeat   = negotiate_max_value(ClientHeartbeat, ServerHeartbeat)}.
+
+negotiate_max_value(Client, Server) when Client =:= 0; Server =:= 0 ->
+    lists:max([Client, Server]);
+negotiate_max_value(Client, Server) ->
+    lists:min([Client, Server]).
 
 start_ok(#nc_state{params = #amqp_params{username = Username,
                                          password = Password}}) ->
