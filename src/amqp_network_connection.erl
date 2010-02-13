@@ -45,8 +45,7 @@
                    max_channel,
                    heartbeat,
                    closing = false,
-                   channels = amqp_channel_util:new_channel_dict(),
-                   server_properties}).
+                   channels = amqp_channel_util:new_channel_dict()}).
 
 -record(nc_closing, {reason,
                      close,
@@ -60,6 +59,10 @@
 init(AmqpParams) ->
     process_flag(trap_exit, true),
     State0 = handshake(#nc_state{params = AmqpParams}),
+    ?LOG_DEBUG("Spawned network connection process (~p).~n"
+               "    AmqpParams= ~p~n"
+               "    InitialState= ~p~n",
+               [self(), AmqpParams, State0]),
     {ok, State0}.
 
 %% Standard handling of an app initiated command
@@ -86,7 +89,7 @@ handle_info(timeout_waiting_for_close_ok = Msg,
 handle_info({'EXIT', Pid, Reason}, State) ->
     handle_exit(Pid, Reason, State).
 
-terminate(_Reason, #nc_state{channel0_framing_pid = Framing0Pid,
+terminate(Reason, #nc_state{channel0_framing_pid = Framing0Pid,
                              channel0_writer_pid = Writer0Pid,
                              main_reader_pid = MainReaderPid}) ->
     ok = amqp_channel_util:terminate_channel_infrastructure(
@@ -95,7 +98,11 @@ terminate(_Reason, #nc_state{channel0_framing_pid = Framing0Pid,
         undefined -> ok;
         _         -> MainReaderPid ! close,
                      ok
-    end.
+    end,
+    ?LOG_DEBUG("Network connection process (~p): terminating~n"
+               "    Reason= ~p~n",
+               [self(), Reason]),
+    ok.
 
 code_change(_OldVsn, State, _Extra) ->
     State.
@@ -177,6 +184,7 @@ handle_method(#'connection.close_ok'{}, none,
 set_closing_state(ChannelCloseType, Closing, 
                   #nc_state{closing = false,
                             channels = Channels} = State) ->
+    log_set_closing_state(ChannelCloseType, Closing, State),
     amqp_channel_util:broadcast_to_channels(
         {connection_closing, ChannelCloseType, closing_to_reason(Closing)},
         Channels),
@@ -185,6 +193,7 @@ set_closing_state(ChannelCloseType, Closing,
 set_closing_state(ChannelCloseType, NewClosing,
                   #nc_state{closing = CurClosing,
                             channels = Channels} = State) ->
+    log_set_closing_state(ChannelCloseType, NewClosing, State),
     %% Do not override reason in channels (because it might cause channels to
     %% to exit with different reasons) but do cause them to close abruptly
     %% if the new closing type requires it
@@ -217,6 +226,13 @@ set_closing_state(ChannelCloseType, NewClosing,
         server_initiated_close -> all_channels_closed_event(NewState);
         _                      -> NewState
     end.
+
+log_set_closing_state(ChannelCloseType, Closing, State) ->
+    ?LOG_DEBUG("Network connection process (~p): setting closing state~n"
+               "    ChannelCloseType= ~p~n"
+               "    Closing= ~p~n"
+               "    CurrentState= ~p~n",
+               [self(), ChannelCloseType, Closing, State]).
 
 %% The all_channels_closed_event is called when all channels have been closed
 %% after the connection broadcasts a connection_closing message to all channels
@@ -403,30 +419,50 @@ do_handshake(State0 = #nc_state{sock = Sock}) ->
 
 network_handshake(State = #nc_state{channel0_writer_pid = Writer0,
                                     params = Params}) ->
-    #'connection.start'{server_properties = ServerProps} = handshake_recv(State),
+    Start = handshake_recv(State),
+    ok = check_version(Start),
     amqp_channel_util:do(network, Writer0, start_ok(State), none),
-    #'connection.tune'{channel_max = ChannelMax,
-                       frame_max = FrameMax,
-                       heartbeat = Heartbeat} = handshake_recv(State),
-    TuneOk = #'connection.tune_ok'{channel_max = ChannelMax,
-                                   frame_max = FrameMax,
-                                   heartbeat = Heartbeat},
+    Tune = handshake_recv(State),
+    TuneOk = negotiate_values(Tune, Params),
     amqp_channel_util:do(network, Writer0, TuneOk, none),
-    %% This is something where I don't understand the protocol,
-    %% What happens if the following command reaches the server
-    %% before the tune ok?
-    %% Or doesn't get sent at all?
     ConnectionOpen =
-        #'connection.open'{virtual_host = Params#amqp_params.virtual_host},
+        #'connection.open'{virtual_host = Params#amqp_params.virtual_host,
+                           insist = true},
     amqp_channel_util:do(network, Writer0, ConnectionOpen, none),
+    %% 'connection.redirect' not implemented (we use insist = true to cover)
     #'connection.open_ok'{} = handshake_recv(State),
-    %% TODO What should I do with the KnownHosts?
-    MaxChannelNumber = if ChannelMax =:= 0 -> ?MAX_CHANNEL_NUMBER;
-                          true             -> ChannelMax
-                       end,
-    State#nc_state{max_channel = MaxChannelNumber,
-                   heartbeat = Heartbeat,
-                   server_properties = ServerProps}.
+    #'connection.tune_ok'{channel_max = ChannelMax,
+                          frame_max   = FrameMax,
+                          heartbeat   = Heartbeat} = TuneOk,
+    ?LOG_DEBUG("Network connection process (~p): negotiated maximums~n"
+               "    ChannelMax= ~p~n"
+               "    FrameMax= ~p~n"
+               "    Heartbeat= ~p~n",
+               [self(), ChannelMax, FrameMax, Heartbeat]),
+    State#nc_state{max_channel = ChannelMax, heartbeat = Heartbeat}.
+
+check_version(#'connection.start'{version_major = ?PROTOCOL_VERSION_MAJOR,
+                                  version_minor = ?PROTOCOL_VERSION_MINOR}) ->
+    ok;
+check_version(#'connection.start'{version_major = Major,
+                                  version_minor = Minor}) ->
+    exit({protocol_version_mismatch, Major, Minor}).
+
+negotiate_values(#'connection.tune'{channel_max = ServerChannelMax,
+                                    frame_max   = ServerFrameMax,
+                                    heartbeat   = ServerHeartbeat},
+                 #amqp_params{channel_max = ClientChannelMax,
+                              frame_max   = ClientFrameMax,
+                              heartbeat   = ClientHeartbeat}) ->
+    #'connection.tune_ok'{
+        channel_max = negotiate_max_value(ClientChannelMax, ServerChannelMax),
+        frame_max   = negotiate_max_value(ClientFrameMax, ServerFrameMax),
+        heartbeat   = negotiate_max_value(ClientHeartbeat, ServerHeartbeat)}.
+
+negotiate_max_value(Client, Server) when Client =:= 0; Server =:= 0 ->
+    lists:max([Client, Server]);
+negotiate_max_value(Client, Server) ->
+    lists:min([Client, Server]).
 
 start_ok(#nc_state{params = #amqp_params{username = Username,
                                          password = Password}}) ->
