@@ -26,7 +26,6 @@
 -module(amqp_direct_connection).
 
 -include("amqp_client.hrl").
--include("amqp_connection_util.hrl").
 
 -behaviour(gen_server).
 
@@ -58,7 +57,12 @@ init(AmqpParams = #amqp_params{username = User,
     rabbit_access_control:check_vhost_access(#user{username = User,
                                                    password = Pass},
                                              VHost),
-    {ok, #dc_state{params = AmqpParams}}.
+    State0 = #dc_state{params = AmqpParams},
+    ?LOG_DEBUG("Spawned direct connection process (~p).~n"
+               "    AmqpParams= ~p~n"
+               "    InitialState= ~p~n",
+               [self(), AmqpParams, State0]),
+    {ok, State0}.
 
 %% Standard handling of an app initiated command
 handle_call({command, Command}, From, #dc_state{closing = Closing} = State) ->
@@ -84,7 +88,10 @@ handle_info({shutdown, Reason}, State) ->
 handle_info({'EXIT', Pid, Reason}, State) ->
     handle_exit(Pid, Reason, State).
 
-terminate(_Reason, _State) ->
+terminate(Reason, _State) ->
+    ?LOG_DEBUG("Direct connection process (~p): terminating~n"
+               "    Reason=~p~n",
+               [self(), Reason]),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -95,11 +102,16 @@ code_change(_OldVsn, State, _Extra) ->
 %%---------------------------------------------------------------------------
 
 handle_command({open_channel, ProposedNumber}, _From,
-               State = #dc_state{params = Params}) ->
-    {reply, Msg, GenState} =
-        ?UTIL(handle_open_channel,
-              [ProposedNumber, ?MAX_CHANNEL_NUMBER, direct, Params], State),
-    {reply, Msg, from_gen_c_state(GenState, State)};
+               State = #dc_state{params = Params,
+                                 channels = Channels}) ->
+    try amqp_channel_util:open_channel(ProposedNumber, ?MAX_CHANNEL_NUMBER,
+                                       direct, Params, Channels) of
+        {ChannelPid, NewChannels} ->
+            {reply, ChannelPid, State#dc_state{channels = NewChannels}}
+    catch
+        error:out_of_channel_numbers = Error ->
+            {reply, {Error, ?MAX_CHANNEL_NUMBER}, State}
+    end;
 
 handle_command({close, Close}, From, State) ->
     {noreply, set_closing_state(flush, #dc_closing{reason = app_initiated_close,
@@ -112,24 +124,38 @@ handle_command({close, Close}, From, State) ->
 %%---------------------------------------------------------------------------
 
 %% Changes connection's state to closing.
-%% ChannelCloseType can be flush or abrupt.
-set_closing_state(ChannelCloseType, Closing,
-                  #dc_state{closing = false} = State) ->
-    ?UTIL2(set_initial_closing,
-          [ChannelCloseType, Closing, closing_to_reason(Closing)], State);
-%% Already closing, override situation.
+%%
+%% ChannelCloseType can be flush or abrupt
+%%
 %% The precedence of the closing MainReason's is as follows:
 %%     app_initiated_close, internal_error, server_initiated_close
 %% (i.e.: a given reason can override the currently set one if it is later
 %% mentioned in the above list). We can rely on erlang's comparison of atoms
 %% for this.
+set_closing_state(ChannelCloseType, Closing,
+                  #dc_state{closing = false,
+                            channels = Channels} = State) ->
+    log_set_closing_state(ChannelCloseType, Closing, State),
+    amqp_channel_util:broadcast_to_channels(
+        {connection_closing, ChannelCloseType, closing_to_reason(Closing)},
+        Channels),
+    check_trigger_all_channels_closed_event(State#dc_state{closing = Closing});
+%% Already closing, override situation
 set_closing_state(ChannelCloseType, NewClosing,
-                  #dc_state{closing = CurClosing} = State) ->
+                  #dc_state{closing = CurClosing,
+                            channels = Channels} = State) ->
+    log_set_closing_state(ChannelCloseType, NewClosing, State),
     %% Do not override reason in channels (because it might cause channels to
     %% to exit with different reasons) but do cause them to close abruptly
     %% if the new closing type requires it
-    ?UTIL(broadcast_closing_if_abrupt,
-          [ChannelCloseType, closing_to_reason(CurClosing)], State),
+    case ChannelCloseType of
+        abrupt ->
+            amqp_channel_util:broadcast_to_channels(
+                {connection_closing, ChannelCloseType,
+                 closing_to_reason(CurClosing)},
+                Channels);
+        _ -> ok
+   end,
    ResClosing =
        if
            %% Override (rely on erlang's comparison of atoms)
@@ -141,15 +167,22 @@ set_closing_state(ChannelCloseType, NewClosing,
        end,
    State#dc_state{closing = ResClosing}.
 
+log_set_closing_state(ChannelCloseType, Closing, State) ->
+    ?LOG_DEBUG("Direct connection process (~p): setting closing state~n"
+               "    ChannelCloseType= ~p~n"
+               "    Closing= ~p~n"
+               "    CurrentState= ~p~n",
+               [self(), ChannelCloseType, Closing, State]).
+
 %% The all_channels_closed_event is called when all channels have been closed
 %% after the connection broadcasts a connection_closing message to all channels
-all_channels_closed_event(none, Closing) ->
+all_channels_closed_event(#dc_state{closing = Closing} = State) ->
     case Closing#dc_closing.from of
         none -> ok;
         From -> gen_server:reply(From, ok)
     end,
     self() ! {shutdown, closing_to_reason(Closing)},
-    Closing.
+    State.
 
 closing_to_reason(#dc_closing{reason = Reason,
                               close = #'connection.close'{reply_code = Code,
@@ -166,31 +199,35 @@ internal_error_closing() ->
                 reply = {internal_error, ?INTERNAL_ERROR, <<>>}}.
 
 %%---------------------------------------------------------------------------
-%% amqp_connection_util related functions
+%% Channel utilities
 %%---------------------------------------------------------------------------
 
-gen_c_state(#dc_state{channels = Channels, closing = Closing}) ->
-    #gen_c_state{channels = Channels,
-                 closing = Closing,
-                 all_channels_closed_event_handler =
-                     fun all_channels_closed_event/2,
-                 all_channels_closed_event_params = none}.
+unregister_channel(Pid, State = #dc_state{channels = Channels}) ->
+    NewChannels = amqp_channel_util:unregister_channel_pid(Pid, Channels),
+    NewState = State#dc_state{channels = NewChannels},
+    check_trigger_all_channels_closed_event(NewState).
 
-from_gen_c_state(#gen_c_state{channels = Channels, closing = Closing}, State) ->
-    State#dc_state{channels = Channels, closing = Closing}.
+check_trigger_all_channels_closed_event(#dc_state{closing = false} = State) ->
+    State;
+check_trigger_all_channels_closed_event(
+        #dc_state{channels = Channels} = State) ->
+    case amqp_channel_util:is_channel_dict_empty(Channels) of
+        true  -> all_channels_closed_event(State);
+        false -> State
+    end.
 
 %%---------------------------------------------------------------------------
 %% Trap exits
 %%---------------------------------------------------------------------------
 
 %% Standard handling of exit signals
-handle_exit(Pid, Reason, State) ->
-    case ?UTIL(handle_exit, [Pid, Reason], State) of
+handle_exit(Pid, Reason,
+            #dc_state{channels = Channels, closing = Closing} = State) ->
+    case amqp_channel_util:handle_exit(Pid, Reason, Channels, Closing) of
         stop   -> {stop, Reason, State};
-        normal -> {noreply, ?UTIL2(unregister_channel, [Pid], State)};
-        close  -> {noreply,
-                   set_closing_state(abrupt, internal_error_closing(),
-                                     ?UTIL2(unregister_channel, [Pid], State))};
-        other  -> {noreply,
-                   set_closing_state(abrupt, internal_error_closing(), State)}
+        normal -> {noreply, unregister_channel(Pid, State)};
+        close  -> {noreply, set_closing_state(abrupt, internal_error_closing(),
+                                              unregister_channel(Pid, State))};
+        other  -> {noreply, set_closing_state(abrupt, internal_error_closing(),
+                                              State)}
     end.

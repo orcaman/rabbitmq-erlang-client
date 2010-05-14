@@ -72,29 +72,22 @@ hard_error_test(Connection) ->
     test_util:wait_for_death(Channel),
     test_util:wait_for_death(Connection).
 
-%% An error in a channel should result in the death of the entire connection.
-%% The death of the channel is caused by an error in generating the frames
-%% (writer dies) - only in the network case
-channel_writer_death_test(Connection) ->
-    Channel = amqp_connection:open_channel(Connection),
+
+%% Refer to bug 21172 to find out how this is caused
+channel_death_test(Connection) ->
+    C1 = amqp_connection:open_channel(Connection),
+    ok = amqp_channel:close(C1),
+    C2 = amqp_connection:open_channel(Connection),
     Publish = #'basic.publish'{routing_key = <<>>, exchange = <<>>},
     Message = #amqp_msg{props = <<>>, payload = <<>>},
-    ok = amqp_channel:call(Channel, Publish, Message),
-    timer:sleep(300),
-    ?assertNot(is_process_alive(Channel)),
-    ?assertNot(is_process_alive(Connection)),
-    ok.
-
-%% An error in the channel process should result in the death of the entire
-%% connection. The death of the channel is caused by making a call with an
-%% invalid message to the channel process
-channel_death_test(Connection) ->
-    Channel = amqp_connection:open_channel(Connection),
-    ?assertExit(_, amqp_channel:call(Channel, bogus_message)),
-    timer:sleep(300),
-    ?assertNot(is_process_alive(Channel)),
-    ?assertNot(is_process_alive(Connection)),
-    ok.
+    ok = amqp_channel:call(C2, Publish, Message),
+    timer:sleep(1000),
+    ?assertNot(is_process_alive(C2)),
+    ?assert(is_process_alive(Connection)),
+    C3 = amqp_connection:open_channel(Connection),
+    ?assert(is_process_alive(C3)),
+    test_util:teardown(Connection, C3).
+    
 
 non_existent_user_test() ->
     Params = #amqp_params{username = test_util:uuid(),
