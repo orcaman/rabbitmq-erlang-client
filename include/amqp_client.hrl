@@ -23,6 +23,8 @@
 %%   Contributor(s): Ben Hood <0x6e6562@gmail.com>.
 %%
 
+-include("version.hrl").
+
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
 
@@ -43,6 +45,14 @@
                       heartbeat    = 0,
                       ssl_options  = none}).
 
--define(LOG_DEBUG(Format), error_logger:info_msg(Format)).
 -define(LOG_INFO(Format, Args), error_logger:info_msg(Format, Args)).
 -define(LOG_WARN(Format, Args), error_logger:warning_msg(Format, Args)).
+
+%% Enable debug output by setting env var DEBUG_OUTPUT="true" when running make
+%% targets
+-ifdef(enable_debug_output).
+-define(LOG_DEBUG(Format, Args), error_logger:info_msg(Format, Args)).
+-else.
+%% Avoid a warning (this does nothing)
+-define(LOG_DEBUG(Format, Args), fun() -> {Format, Args} end()).
+-endif.

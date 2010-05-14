@@ -46,13 +46,11 @@
 %%
 %% This is an example of how the client interaction should work
 %%
-%%   Connection = amqp_connection:start(#amqp_params{}),
+%%   Connection = amqp_connection:start_network(),
 %%   Channel = amqp_connection:open_channel(Connection),
 %%   %%...do something useful
-%%   ChannelClose = #'channel.close'{ %% set the appropriate fields },
-%%   amqp_channel:call(Channel, ChannelClose),
-%%   ConnectionClose = #'connection.close'{ %% set the appropriate fields },
-%%   amqp_connection:close(Connection, ConnectionClose).
+%%   amqp_channel:close(Channel),
+%%   amqp_connection:close(Connection).
 %%
 
 lifecycle_test(Connection) ->
@@ -443,7 +441,7 @@ channel_flow_test(Connection) ->
     receive
         ok -> ok
     after 10000 ->
-        ?LOG_DEBUG("Are you sure that you have waited 1 minute?~n"),
+        ?LOG_INFO("Are you sure that you have waited 1 minute?~n", []),
         exit(did_not_receive_channel_flow)
     end.
 
@@ -521,7 +519,7 @@ cf_producer_loop(Channel, X, Key, PublishFun, Payload, N) ->
 cf_handler_loop(Producer) ->
     receive
         #'channel.flow'{active = false} ->
-            ?LOG_DEBUG("Producer throttling ON~n"),
+            ?LOG_INFO("Producer throttling ON~n", []),
             cf_handler_loop(Producer);
         #'channel.flow'{active = true} ->
             ?LOG_INFO("Producer throttling OFF, waking up producer (~p)~n",
