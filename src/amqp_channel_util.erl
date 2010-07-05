@@ -35,7 +35,7 @@
          unregister_channel_pid/2, resolve_channel_number/2,
          resolve_channel_pid/2, is_channel_number_registered/2,
          is_channel_pid_registered/2, channel_number/3]).
--export([broadcast_to_channels/2, handle_exit/4]).
+-export([broadcast_to_channels/2]).
 
 %%---------------------------------------------------------------------------
 %% Opening channels
@@ -49,6 +49,10 @@ open_channel(ProposedNumber, MaxChannel, Driver, StartArgs, Channels) ->
         amqp_channel, {self(), ChannelNumber, Driver, StartArgs}, []),
     #'channel.open_ok'{} = amqp_channel:call(ChannelPid, #'channel.open'{}),
     NewChannels = register_channel(ChannelNumber, ChannelPid, Channels),
+    ?LOG_DEBUG("Process (~p) started channel (~p) with number ~p.~n"
+               "    Driver= ~p~n"
+               "    StartArgs= ~p~n",
+               [self(), ChannelPid, ChannelNumber, Driver, StartArgs]),
     {ChannelPid, NewChannels}.
 
 %%---------------------------------------------------------------------------
@@ -74,20 +78,38 @@ start_channel_infrastructure(network, ChannelNumber, {Sock, MainReader}) ->
                     erlang:error(main_reader_died_while_registering_framing)
             end
     end,
+    log_start_channel_infrastructure(network, ChannelNumber,
+                                     {FramingPid, WriterPid}),
     {FramingPid, WriterPid};
 start_channel_infrastructure(
         direct, ChannelNumber, {User, VHost, Collector}) ->
     Peer = rabbit_channel:start_link(ChannelNumber, self(), self(), User, VHost,
                                      Collector),
+    log_start_channel_infrastructure(direct, ChannelNumber, {Peer, Peer}),
     {Peer, Peer}.
 
+log_start_channel_infrastructure(Driver, ChannelNumber, {Reader, Writer}) ->
+    ?LOG_DEBUG("Started ~p channel infrastructure for process (~p).~n"
+               "    ChannelNumber= ~p~n"
+               "    Reader/Framing= ~p~n"
+               "    Writer= ~p~n",
+               [Driver, self(), ChannelNumber, Reader, Writer]).
+    
 terminate_channel_infrastructure(network, {FramingPid, WriterPid}) ->
+    log_terminate_channel_infrastructure(network, {FramingPid, WriterPid}),
     rabbit_framing_channel:shutdown(FramingPid),
     rabbit_writer:shutdown(WriterPid),
     ok;
 terminate_channel_infrastructure(direct, {Peer, Peer})->
+    log_terminate_channel_infrastructure(direct, {Peer, Peer}),
     gen_server2:cast(Peer, terminate),
     ok.
+
+log_terminate_channel_infrastructure(Driver, {Reader, Writer}) ->
+    ?LOG_DEBUG("Process (~p) terminating ~p channel infrastructure.~n"
+               "    Reader/Framing= ~p~n"
+               "    Writer= ~p~n",
+               [self(), Driver, Reader, Writer]).
 
 %%---------------------------------------------------------------------------
 %% Do
@@ -227,35 +249,3 @@ broadcast_to_channels(Message, _Channels = {_, DictPN}) ->
     dict:map(fun(ChannelPid, _) -> ChannelPid ! Message, ok end, DictPN),
     ok.
 
-handle_exit(Pid, Reason, Channels, Closing) ->
-    case is_channel_pid_registered(Pid, Channels) of
-        true  -> handle_channel_exit(Pid, Reason, Closing);
-        false -> ?LOG_WARN("Connection (~p) closing: received unexpected "
-                           "exit signal from (~p). Reason: ~p~n",
-                           [self(), Pid, Reason]),
-                 other
-    end.
-
-handle_channel_exit(_Pid, normal, _Closing) ->
-    %% Normal amqp_channel shutdown
-    normal;
-handle_channel_exit(Pid, {server_initiated_close, Code, _Text}, false) ->
-    %% Channel terminating (server sent 'channel.close')
-    {IsHardError, _, _} = rabbit_framing:lookup_amqp_exception(
-                            rabbit_framing:amqp_exception(Code)),
-    case IsHardError of
-        true  -> ?LOG_WARN("Connection (~p) closing: channel (~p) "
-                           "received hard error from server~n", [self(), Pid]),
-                 stop;
-        false -> normal
-    end;
-handle_channel_exit(_Pid, {_CloseReason, _Code, _Text}, Closing)
-  when Closing =/= false ->
-    %% Channel terminating due to connection closing
-    normal;
-handle_channel_exit(Pid, Reason, _Closing) ->
-    %% amqp_channel dies with internal reason - this takes
-    %% the entire connection down
-    ?LOG_WARN("Connection (~p) closing: channel (~p) died. Reason: ~p~n",
-              [self(), Pid, Reason]),
-    close.
