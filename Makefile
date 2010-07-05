@@ -30,21 +30,40 @@ DEPS=$(shell erl -noshell -eval '{ok,[{_,_,[_,_,{modules, Mods},_,_,_]}]} = \
 VERSION=0.0.0
 SOURCE_PACKAGE_NAME=$(PACKAGE)-$(VERSION)-src
 
+<<<<<<< local
+.PHONY: common_package dist
+=======
 INFILES=$(shell find . -name '*.app.in')
 INTARGETS=$(patsubst %.in, %, $(INFILES))
 
 .PHONY: common_package
+>>>>>>> other
 
 include common.mk
 
 clean: common_clean
+<<<<<<< local
+	rm -f  $(INCLUDE_DIR)/version.hrl
+=======
 	rm -f $(INTARGETS)
+>>>>>>> other
 	rm -fr $(DIST_DIR)
 
 %.app: %.app.in
 	sed -e 's:%%VSN%%:$(VERSION):g' < $< > $@
 
-###############################################################################
+<<<<<<< local
+dist: doc source_tarball package
+=======
+>>>>>>> other
+
+<<<<<<< local
+=======
+$(INCLUDE_DIR)/version.hrl: $(INCLUDE_DIR)/version.hrl.in
+	sed -e 's:%%VERSION%%:$(VERSION):g' < $< > $@
+
+>>>>>>> other
+##############################################################################
 ##  Testing
 ###############################################################################
 
@@ -55,7 +74,7 @@ test_common_package: common_package package prepare_tests
 	OK=true && \
 	TMPFILE=$(MKTEMP) && \
 	    { $(LIBS_PATH) erl -noshell -pa $(TEST_DIR) \
-	    -eval 'error_logger:tty(false), network_client_SUITE:test(), halt().' 2>&1 | \
+	    -eval 'network_client_SUITE:test(), halt().' 2>&1 | \
 		tee $$TMPFILE || OK=false; } && \
 	{ egrep "All .+ tests (successful|passed)." $$TMPFILE || OK=false; } && \
 	rm $$TMPFILE && \
@@ -70,24 +89,32 @@ COPY=cp -pR
 
 common_package: $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
 
+$(BROKER_DIR)/$(INCLUDE_DIR)/rabbit_framing.hrl \
+$(BROKER_DIR)/$(SOURCE_DIR)/rabbit_framing.erl:
+	$(MAKE) -C $(BROKER_DIR)
+
 $(DIST_DIR)/$(COMMON_PACKAGE_NAME): $(BROKER_SOURCES) $(BROKER_HEADERS) $(COMMON_PACKAGE).app
 	$(MAKE) -C $(BROKER_DIR)
-	mkdir -p $(DIST_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)
-	mkdir -p $(DIST_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR)
-	cp $(COMMON_PACKAGE).app $(DIST_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR)
+	mkdir -p $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(INCLUDE_DIR)
+	mkdir -p $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(EBIN_DIR)
+	cp $(COMMON_PACKAGE).app $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(EBIN_DIR)
 	$(foreach DEP, $(DEPS), \
         ( cp $(BROKER_DIR)/$(EBIN_DIR)/$(DEP).beam \
-          $(DIST_DIR)/$(COMMON_PACKAGE)/$(EBIN_DIR) \
+          $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(EBIN_DIR) \
         );)
-	cp $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl $(DIST_DIR)/$(COMMON_PACKAGE)/$(INCLUDE_DIR)
-	(cd $(DIST_DIR); zip -r $(COMMON_PACKAGE_NAME) $(COMMON_PACKAGE))
+	cp $(BROKER_DIR)/$(INCLUDE_DIR)/*.hrl $(DIST_DIR)/$(COMMON_PACKAGE_VSN)/$(INCLUDE_DIR)
+	(cd $(DIST_DIR); zip -r $(COMMON_PACKAGE_NAME) $(COMMON_PACKAGE_VSN))
 
-source_tarball: clean $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
+<<<<<<< local
+source_tarball: $(DIST_DIR)/$(COMMON_PACKAGE_NAME)
+=======
+source_tarball: clean $(DIST_DIR)/$(COMMON_PACKAGE_NAME) $(INCLUDE_DIR)/version.hrl
+>>>>>>> other
 	mkdir -p $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(DIST_DIR)
 	$(COPY) $(DIST_DIR)/$(COMMON_PACKAGE_NAME) $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(DIST_DIR)/
 	$(COPY) README $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/
 	$(COPY) common.mk $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/
-	$(COPY) Makefile.in $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/Makefile
+	sed 's/%%VSN%%/$(VERSION)/' Makefile.in > $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/Makefile
 	mkdir -p $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(SOURCE_DIR)
 	$(COPY) $(SOURCE_DIR)/*.erl $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(SOURCE_DIR)/
 	mkdir -p $(DIST_DIR)/$(SOURCE_PACKAGE_NAME)/$(EBIN_DIR)
