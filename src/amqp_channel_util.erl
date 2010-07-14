@@ -247,13 +247,17 @@ handle_channel_exit(Pid, {server_initiated_close, Code, _Text}, false) ->
                  stop;
         false -> normal
     end;
+handle_channel_exit(Pid, {hard_error, Close}, _Closing) ->
+    %% Channel terminating with hard error - takes the entire connection down
+    ?LOG_WARN("Connection (~p) closing due to hard error in channel (~p)~n",
+              [self(), Pid]),
+    {error, Close};
 handle_channel_exit(_Pid, {_CloseReason, _Code, _Text}, Closing)
   when Closing =/= false ->
     %% Channel terminating due to connection closing
     normal;
-handle_channel_exit(Pid, Reason, _Closing) ->
-    %% amqp_channel dies with internal reason - this takes
-    %% the entire connection down
-    ?LOG_WARN("Connection (~p) closing: channel (~p) died. Reason: ~p~n",
-              [self(), Pid, Reason]),
-    close.
+handle_channel_exit(Pid, _Reason, _Closing) ->
+    %% amqp_channel died with internal reason - takes the entire connection down
+    ?LOG_WARN("Connection (~p): channel (~p) died with internal reason~n",
+              [self(), Pid]),
+    internal_error.
