@@ -166,4 +166,3 @@ internal_register_framing_channel(
     NewChannels = amqp_channel_util:register_channel(Number, Pid, Channels),
     erlang:monitor(process, Pid),
     State#mr_state{framing_channels = NewChannels}.
-
