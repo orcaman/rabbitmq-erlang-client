@@ -65,8 +65,6 @@ start_infrastructure(Sup, network, [Sock, MainReader], ChPid, ChNumber) ->
                   {writer, {rabbit_writer, start_link,
                             [Sock, ChNumber, ?FRAME_MIN_SIZE, ?PROTOCOL]},
                    permanent, ?MAX_WAIT, worker, [rabbit_writer]}),
-    %% This call will disapear as part of bug 23024
-    amqp_main_reader:register_framing_channel(MainReader, ChNumber, Framing),
     ok.
 
 %%---------------------------------------------------------------------------
