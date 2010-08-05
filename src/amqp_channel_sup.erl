@@ -55,18 +55,15 @@ start_infrastructure(Sup, direct, [User, VHost, Collector], ChPid, ChNumber) ->
                                      Collector]},
                    permanent, ?MAX_WAIT, worker, [rabbit_channel]}),
     ok;
-start_infrastructure(Sup, network, [Sock, MainReader], ChPid, ChNumber) ->
-    {ok, Framing} = supervisor2:start_child(Sup,
-                        {framing, {rabbit_framing_channel, start_link,
-                                   [ChPid, ?PROTOCOL]},
-                         permanent, ?MAX_WAIT, worker,
-                         [rabbit_framing_channel]}),
+start_infrastructure(Sup, network, [Sock], ChPid, ChNumber) ->
+    {ok, _} = supervisor2:start_child(Sup,
+                  {framing, {rabbit_framing_channel, start_link,
+                             [ChPid, ?PROTOCOL]},
+                   permanent, ?MAX_WAIT, worker, [rabbit_framing_channel]}),
     {ok, _} = supervisor2:start_child(Sup,
                   {writer, {rabbit_writer, start_link,
                             [Sock, ChNumber, ?FRAME_MIN_SIZE, ?PROTOCOL]},
                    permanent, ?MAX_WAIT, worker, [rabbit_writer]}),
-    %% This call will disapear as part of bug 23024
-    amqp_main_reader:register_framing_channel(MainReader, ChNumber, Framing),
     ok.
 
 %%---------------------------------------------------------------------------

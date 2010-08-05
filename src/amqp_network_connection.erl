@@ -29,7 +29,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/1, connect/1]).
+-export([start_link/2, connect/1]).
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2]).
 
@@ -41,29 +41,28 @@
 -record(state, {sup,
                 params,
                 sock,
-                max_channel,
+                channel_max,
                 heartbeat,
-                framing0,
-                writer0,
-                main_reader,
-                channel_sup_sup,
+                framing0 = undefined,
+                writer0 = undefined,
+                main_reader = undefined,
+                channels_manager,
                 closing = false,
-                server_properties,
-                channels = amqp_channel_util:new_channel_dict()}).
+                server_properties}).
 
 -record(closing, {reason,
                   close,
                   from = none,
                   phase = terminate_channels}).
 
--define(INFO_KEYS, (amqp_connection:info_keys() ++ [max_channel, heartbeat])).
+-define(INFO_KEYS, (amqp_connection:info_keys() ++ [channel_max, heartbeat])).
 
 %%---------------------------------------------------------------------------
 %% Internal interface
 %%---------------------------------------------------------------------------
 
-start_link(AmqpParams) ->
-    gen_server:start_link(?MODULE, [self(), AmqpParams], []).
+start_link(AmqpParams, ChMgr) ->
+    gen_server:start_link(?MODULE, [self(), AmqpParams, ChMgr], []).
 
 connect(Pid) ->
     gen_server:call(Pid, connect, infinity).
@@ -72,8 +71,8 @@ connect(Pid) ->
 %% gen_server callbacks
 %%---------------------------------------------------------------------------
 
-init([Sup, AmqpParams]) ->
-    {ok, #state{sup = Sup, params = AmqpParams}}.
+init([Sup, AmqpParams, ChMgr]) ->
+    {ok, #state{sup = Sup, params = AmqpParams, channels_manager = ChMgr}}.
 
 handle_call({command, Command}, From, #state{closing = Closing} = State) ->
     case Closing of
@@ -92,21 +91,22 @@ handle_call(connect, _From, State) ->
 handle_cast({method, Method, Content}, State) ->
     handle_method(Method, Content, State).
 
-%% This is received after we have sent 'connection.close' to the server
-%% but timed out waiting for 'connection.close_ok' back
 handle_info(timeout_waiting_for_close_ok, State = #state{closing = Closing}) ->
     #closing{phase = wait_close_ok} = Closing, % assertion
     {stop, {timeout_waiting_for_close_ok, closing_to_reason(Closing)}, State};
-%% This is received when the main reader has not sent socket_closed in time
 handle_info(socket_closing_timeout, State = #state{closing = Closing}) ->
     #closing{phase = wait_socket_close} = Closing, % assertion
     {stop, {socket_closing_timeout, closing_to_reason(Closing)}, State};
-%% Received from main reader
 handle_info(socket_closed, State) ->
     handle_socket_closed(State);
-%% DOWN signals from channels
-handle_info({'DOWN', _, process, Pid, Reason}, State) ->
-    handle_channel_exit(Pid, Reason, State).
+handle_info({hard_error_in_channel, Pid, Reason}, State) ->
+    ?LOG_WARN("Connection (~p) closing: channel (~p) received hard error ~p "
+              "from server~n", [self(), Pid, Reason]),
+    {stop, Reason, State};
+handle_info({channel_internal_error, _Pid, _Reason}, State) ->
+    {noreply, set_closing_state(abrupt, internal_error_closing(), State)};
+handle_info(all_channels_terminated, State) ->
+    handle_all_channels_terminated(State).
 
 terminate(_Reason, #state{sup = Sup}) ->
     [CTSup] = supervisor2:find_child(Sup, connection_type_sup),
@@ -120,21 +120,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%---------------------------------------------------------------------------
 
 handle_command({open_channel, ProposedNumber}, _From,
-               State = #state{sup = Sup,
-                              sock = Sock,
-                              channels = Channels,
-                              max_channel = MaxChannel}) ->
-    [CTSup] = supervisor2:find_child(Sup, connection_type_sup),
-    [MainReader] = supervisor2:find_child(CTSup, main_reader),
-    try amqp_channel_util:open_channel(Sup, ProposedNumber, MaxChannel,
-                                       [Sock, MainReader], Channels) of
-        {ChannelPid, NewChannels} ->
-            {reply, ChannelPid, State#state{channels = NewChannels}}
-    catch
-        error:out_of_channel_numbers = Error ->
-            {reply, {Error, MaxChannel}, State}
-    end;
-
+               State = #state{sock = Sock, channels_manager = ChMgr}) ->
+    {reply, amqp_channels_manager:open_channel(ChMgr, ProposedNumber, [Sock]),
+     State};
 handle_command({close, #'connection.close'{} = Close}, From, State) ->
     {noreply, set_closing_state(flush, #closing{reason = app_initiated_close,
                                                 close = Close,
@@ -150,7 +138,6 @@ handle_method(#'connection.close'{} = Close, none, State) ->
                                 #closing{reason = server_initiated_close,
                                          close = Close},
                                 State)};
-
 handle_method(#'connection.close_ok'{}, none,
               State = #state{closing = Closing}) ->
     #closing{from = From,
@@ -171,11 +158,12 @@ i(server_properties, State) -> State#state.server_properties;
 i(is_closing,        State) -> State#state.closing =/= false;
 i(amqp_params,       State) -> State#state.params;
 i(supervisor,        State) -> State#state.sup;
-i(max_channel,       State) -> State#state.max_channel;
+i(channel_max,       State) -> State#state.channel_max;
 i(heartbeat,         State) -> State#state.heartbeat;
-i(num_channels,      State) -> amqp_channel_util:num_channels(
-                                   State#state.channels);
-i(Item,             _State) -> throw({bad_argument, Item}).
+i(num_channels,      State) ->
+    amqp_channels_manager:num_channels(State#state.channels_manager);
+i(Item, _State) ->
+    throw({bad_argument, Item}).
 
 %%---------------------------------------------------------------------------
 %% Closing
@@ -205,68 +193,60 @@ i(Item,             _State) -> throw({bad_argument, Item}).
 %% (i.e.: a given reason can override the currently set one if it is later
 %% mentioned in the above list). We can rely on erlang's comparison of atoms
 %% for this.
-set_closing_state(ChannelCloseType, Closing, 
-                  #state{closing = false,
-                         channels = Channels} = State) ->
-    amqp_channel_util:broadcast_to_channels(
-        {connection_closing, ChannelCloseType, closing_to_reason(Closing)},
-        Channels),
-    check_trigger_all_channels_closed_event(State#state{closing = Closing});
+set_closing_state(ChannelCloseType, Closing, State = #state{closing = false}) ->
+    NewState = State#state{closing = Closing},
+    signal_connection_closing(ChannelCloseType, NewState),
+    NewState;
 %% Already closing, override situation
 set_closing_state(ChannelCloseType, NewClosing,
-                  #state{closing = CurClosing,
-                         channels = Channels} = State) ->
+                  State = #state{closing = CurClosing}) ->
+    #closing{reason = NewReason, close = NewClose} = NewClosing,
+    #closing{reason = CurReason} = CurClosing,
+    ResClosing =
+        if
+            %% Override (rely on erlang's comparison of atoms)
+            NewReason >= CurReason ->
+                %% Note that when overriding, we keep the current phase
+                CurClosing#closing{reason = NewReason, close = NewClose};
+            %% Do not override
+            true ->
+                CurClosing
+        end,
+    NewState = State#state{closing = ResClosing},
     %% Do not override reason in channels (because it might cause channels
     %% to exit with different reasons) but do cause them to close abruptly
     %% if the new closing type requires it
     case ChannelCloseType of
-        abrupt ->
-            amqp_channel_util:broadcast_to_channels(
-                {connection_closing, ChannelCloseType,
-                 closing_to_reason(CurClosing)},
-                Channels);
-        _ -> ok
-   end,
-   #closing{reason = NewReason, close = NewClose} = NewClosing,
-   #closing{reason = CurReason} = CurClosing,
-   ResClosing =
-       if
-           %% Override (rely on erlang's comparison of atoms)
-           NewReason >= CurReason ->
-               %% Note that when overriding, we keep the current phase
-               CurClosing#closing{reason = NewReason, close = NewClose};
-           %% Do not override
-           true ->
-               CurClosing
-       end,
-    NewState = State#state{closing = ResClosing},
-    %% Now check if it's the case that the server has sent a connection.close
-    %% while we were in the closing state (for whatever reason). We need to
-    %% send connection.close_ok (it might be even be the case that we are
-    %% sending it again) and wait for the socket to close.
-    case NewReason of
-        server_initiated_close -> all_channels_closed_event(NewState);
-        _                      -> NewState
-    end.
+        abrupt -> signal_connection_closing(abrupt, NewState);
+        _      -> ok
+    end,
+    NewState.
 
-%% The all_channels_closed_event is called when all channels have been closed
-%% after the connection broadcasts a connection_closing message to all channels
-all_channels_closed_event(#state{writer0 = Writer,
-                                 closing = Closing} = State) ->
+signal_connection_closing(ChannelCloseType, #state{channels_manager = ChMgr,
+                                                   closing = Closing}) ->
+    amqp_channels_manager:signal_connection_closing(ChMgr, ChannelCloseType,
+                                                    closing_to_reason(Closing)).
+
+handle_all_channels_terminated(State = #state{writer0 = Writer,
+                                              closing = Closing}) ->
+    #state{closing = #closing{}} = State, % assertion
     #closing{reason = Reason, close = Close} = Closing,
-    case Reason of
-        server_initiated_close ->
-            amqp_channel_util:do(network, Writer, #'connection.close_ok'{},
-                                 none),
-            erlang:send_after(?SOCKET_CLOSING_TIMEOUT, self(),
-                              socket_closing_timeout),
-            State#state{closing = Closing#closing{phase = wait_socket_close}};
-        _ ->
-            amqp_channel_util:do(network, Writer, Close, none),
-            erlang:send_after(?CLIENT_CLOSE_TIMEOUT, self(),
-                              timeout_waiting_for_close_ok),
-            State#state{closing = Closing#closing{phase = wait_close_ok}}
-    end.
+    NewState =
+        case Reason of
+            server_initiated_close ->
+                amqp_channel_util:do(network, Writer, #'connection.close_ok'{},
+                                     none),
+                erlang:send_after(?SOCKET_CLOSING_TIMEOUT, self(),
+                                  socket_closing_timeout),
+                State#state{closing =
+                    Closing#closing{phase = wait_socket_close}};
+            _ ->
+                amqp_channel_util:do(network, Writer, Close, none),
+                erlang:send_after(?CLIENT_CLOSE_TIMEOUT, self(),
+                                  timeout_waiting_for_close_ok),
+                State#state{closing = Closing#closing{phase = wait_close_ok}}
+        end,
+    {noreply, NewState}.
 
 closing_to_reason(#closing{reason = Reason,
                            close = #'connection.close'{reply_code = Code,
@@ -285,37 +265,6 @@ handle_socket_closed(State = #state{closing =
     {stop, closing_to_reason(Closing), State};
 handle_socket_closed(State) ->
     {stop, socket_closed_unexpectedly, State}.
-
-%%---------------------------------------------------------------------------
-%% Channel utilities
-%%---------------------------------------------------------------------------
-
-unregister_channel(Pid, State = #state{channels = Channels}) ->
-    NewChannels = amqp_channel_util:unregister_channel_pid(Pid, Channels),
-    NewState = State#state{channels = NewChannels},
-    check_trigger_all_channels_closed_event(NewState).
-
-check_trigger_all_channels_closed_event(#state{closing = false} = State) ->
-    State;
-check_trigger_all_channels_closed_event(#state{channels = Channels,
-                                               closing = Closing} = State) ->
-    #closing{phase = terminate_channels} = Closing, % assertion
-    case amqp_channel_util:is_channel_dict_empty(Channels) of
-        true  -> all_channels_closed_event(State);
-        false -> State
-    end.
-
-handle_channel_exit(Pid, Reason,
-            #state{channels = Channels, closing = Closing} = State) ->
-    case amqp_channel_util:handle_exit(Pid, Reason, Channels, Closing) of
-        stop   -> {stop, Reason, State};
-        normal -> {noreply, unregister_channel(Pid, State)};
-        close  -> {noreply, set_closing_state(abrupt, internal_error_closing(),
-                                              unregister_channel(Pid, State))};
-        other  -> {noreply, set_closing_state(abrupt, internal_error_closing(),
-                                              State)}
-    end.
-
 %%---------------------------------------------------------------------------
 %% Handshake
 %%---------------------------------------------------------------------------
@@ -351,24 +300,9 @@ do_connect(State = #state{params = #amqp_params{host = Host,
 
 handshake(State0 = #state{sock = Sock}) ->
     ok = rabbit_net:send(Sock, ?PROTOCOL_HEADER),
-    State1 = start_infrastructure(State0),
+    State1 = start_infrastructure_pre_hs(State0),
     State2 = network_handshake(State1),
-    start_heartbeat(State2),
-    State2.
-
-start_infrastructure(State = #state{sup = Sup, sock = Sock}) ->
-    {ok, CTSup} = supervisor2:start_child(Sup,
-        {connection_type_sup, {amqp_connection_type_sup,
-                               start_link_network, [Sock, self()]},
-         permanent, infinity, supervisor, [amqp_connection_type_sup]}),
-    [MainReader, Framing0, Writer0] =
-        [hd(supervisor2:find_child(CTSup, Child)) ||
-            Child <- [main_reader, framing, writer]],
-    [ChannelSupSup] = supervisor2:find_child(Sup, channel_sup_sup),
-    State#state{main_reader = MainReader,
-                framing0 = Framing0,
-                writer0 = Writer0,
-                channel_sup_sup = ChannelSupSup}.
+    start_infrastructure_post_hs(State2).
 
 network_handshake(State = #state{writer0 = Writer, params = Params}) ->
     Start = handshake_recv(),
@@ -388,13 +322,37 @@ network_handshake(State = #state{writer0 = Writer, params = Params}) ->
     ?LOG_INFO("Negotiated maximums: (Channel = ~p, Frame = ~p, "
               "Heartbeat = ~p)~n",
              [ChannelMax, FrameMax, Heartbeat]),
-    State#state{max_channel = ChannelMax,
+    State#state{channel_max = ChannelMax,
                 heartbeat = Heartbeat,
                 server_properties = ServerProperties}.
 
-start_heartbeat(#state{sup = Sup, sock = Sock, heartbeat = Heartbeat}) ->
+start_infrastructure_pre_hs(State = #state{sup = Sup,
+                                           sock = Sock,
+                                           channels_manager = ChMgr}) ->
+    {ok, CTSup} = supervisor2:start_child(Sup,
+        {connection_type_sup, {amqp_connection_type_sup,
+                               start_link_network, [Sock, self(), ChMgr]},
+         permanent, infinity, supervisor, [amqp_connection_type_sup]}),
+    [MainReader, Framing0, Writer0] =
+        [hd(supervisor2:find_child(CTSup, Child)) ||
+            Child <- [main_reader, framing, writer]],
+    State#state{main_reader = MainReader,
+                framing0 = Framing0,
+                writer0 = Writer0}.
+
+start_infrastructure_post_hs(State = #state{sup = Sup,
+                             sock = Sock,
+                             heartbeat = Heartbeat,
+                             channel_max = ChannelMax,
+                             channels_manager = ChMgr}) ->
     [CTSup] = supervisor2:find_child(Sup, connection_type_sup),
-    rabbit_heartbeat:start_heartbeat(CTSup, Sock, Heartbeat).
+    rabbit_heartbeat:start_heartbeat(CTSup, Sock, Heartbeat),
+    case ChannelMax of
+        0 -> ok;
+        _ -> amqp_channels_manager:set_channel_max(ChMgr, ChannelMax)
+    end,
+    amqp_channels_manager:register_connection(ChMgr, self()),
+    State.
 
 check_version(#'connection.start'{version_major = ?PROTOCOL_VERSION_MAJOR,
                                   version_minor = ?PROTOCOL_VERSION_MINOR}) ->

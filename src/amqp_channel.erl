@@ -163,8 +163,11 @@ close(Channel, Code, Text) ->
                              reply_code = Code,
                              class_id   = 0,
                              method_id  = 0},
-    #'channel.close_ok'{} = call(Channel, Close),
-    ok.
+    case call(Channel, Close) of
+        #'channel.close_ok'{} -> ok;
+        Error                 -> Error
+    end.
+
 %%---------------------------------------------------------------------------
 %% Consumer registration (API)
 %%---------------------------------------------------------------------------
@@ -255,7 +258,7 @@ rpc_bottom_half(Reply, State = #state{rpc_requests = RequestQueue}) ->
     end.
 
 do_rpc(State0 = #state{rpc_requests = RequestQueue,
-                      closing = Closing}) ->
+                       closing = Closing}) ->
     State1 = check_writer(State0),
     case queue:peek(RequestQueue) of
         {value, {_From, Method = #'channel.close'{}, Content}} ->
@@ -266,8 +269,10 @@ do_rpc(State0 = #state{rpc_requests = RequestQueue,
             State1;
         empty ->
             case Closing of
-                {connection, Reason} -> self() ! {shutdown, Reason};
-                _                    -> ok
+                {connection, Reason} ->
+                    self() ! {shutdown, {connection_closing, Reason}};
+                _ ->
+                    ok
             end,
             State1
     end.
@@ -335,6 +340,12 @@ check_block(_Method, _AmqpMsg, #state{}) ->
 
 shutdown_with_reason({_, 200, _}, State) ->
     {stop, normal, State};
+shutdown_with_reason({connection_closing, {_, 200, _}}, State) ->
+    {stop, normal, State};
+shutdown_with_reason({connection_closing, normal}, State) ->
+    {stop, normal, State};
+shutdown_with_reason({connection_closing, _} = Reason, State) ->
+    {stop, Reason, State};
 shutdown_with_reason(Reason, State) ->
     {stop, Reason, State}.
 
@@ -610,7 +621,7 @@ handle_info({connection_closing, CloseType, Reason},
                                Reason}),
             {noreply, State};
         _ ->
-            shutdown_with_reason(Reason, State)
+            shutdown_with_reason({connection_closing, Reason}, State)
     end;
 
 %% This is for a channel exception that is sent by the direct
