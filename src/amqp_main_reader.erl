@@ -29,36 +29,32 @@
 
 -behaviour(gen_server).
 
--export([start_link/3, register_framing_channel/3]).
+-export([start_link/4]).
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2]).
 
--record(state, {sup,
-                sock,
+-record(state, {sock,
                 connection,
-                message = none, %% none | {Type, Channel, Length}
-                framing_channels = amqp_channel_util:new_channel_dict()}).
+                channels_manager,
+                framing0,
+                message = none %% none | {Type, Channel, Length}
+               }).
 
 %%---------------------------------------------------------------------------
 %% Interface
 %%---------------------------------------------------------------------------
 
-start_link(Sock, Framing0, Connection) ->
-    gen_server:start_link(?MODULE, [self(), Sock, Framing0, Connection], []).
-
-register_framing_channel(MainReaderPid, Number, FramingPid) ->
-    gen_server:call(MainReaderPid,
-                    {register_framing_channel, Number, FramingPid}, infinity).
+start_link(Sock, Connection, ChMgr, Framing0) ->
+    gen_server:start_link(?MODULE, [Sock, Connection, ChMgr, Framing0], []).
 
 %%---------------------------------------------------------------------------
 %% gen_server callbacks
 %%---------------------------------------------------------------------------
 
-init([Sup, Sock, Framing0, Connection]) ->
-    State0 = #state{sup = Sup, sock = Sock, connection = Connection},
-    State1 = internal_register_framing_channel(0, Framing0, State0),
+init([Sock, Connection, ChMgr, Framing0]) ->
     {ok, _Ref} = rabbit_net:async_recv(Sock, 7, infinity),
-    {ok, State1}.
+    {ok, #state{sock = Sock, connection = Connection,
+                channels_manager = ChMgr, framing0 = Framing0}}.
 
 terminate(Reason, #state{sock = Sock}) ->
     Nice = case Reason of normal        -> true;
@@ -73,16 +69,14 @@ terminate(Reason, #state{sock = Sock}) ->
 code_change(_OldVsn, State, _Extra) ->
     State.
 
-handle_call({register_framing_channel, Number, Pid}, _From, State) ->
-    {reply, ok, internal_register_framing_channel(Number, Pid, State)}.
+handle_call(Call, From, State) ->
+    {stop, {unexpected_call, Call, From}, State}.
 
 handle_cast(Cast, State) ->
     {stop, {unexpected_cast, Cast}, State}.
 
 handle_info({inet_async, _, _, _} = InetAsync, State) ->
-    handle_inet_async(InetAsync, State);
-handle_info({'DOWN', _, _, _, _} = Down, State) ->
-    handle_down(Down, State).
+    handle_inet_async(InetAsync, State).
 
 %%---------------------------------------------------------------------------
 %% Internal plumbing
@@ -129,27 +123,15 @@ handle_frame(Type, Channel, Payload, State) ->
             pass_frame(Channel, AnalyzedFrame, State)
     end.
 
-pass_frame(Channel, Frame, #state{framing_channels = Channels}) ->
-    case amqp_channel_util:resolve_channel_number(Channel, Channels) of
-        undefined ->
-            ?LOG_INFO("Dropping frame ~p for invalid or closed channel "
-                      "number ~p~n", [Frame, Channel]),
-            ok;
-        FramingPid ->
-            rabbit_framing_channel:process(FramingPid, Frame)
+pass_frame(Channel, Frame, State) ->
+    case resolve_channel_number(Channel, State) of
+        undefined  -> ?LOG_INFO("Dropping frame ~p for invalid or closed "
+                                "channel number ~p~n", [Frame, Channel]),
+                      ok;
+        FramingPid -> rabbit_framing_channel:process(FramingPid, Frame)
     end.
 
-handle_down({'DOWN', _MonitorRef, process, Pid, Info},
-            State = #state{framing_channels = Channels}) ->
-    case amqp_channel_util:is_channel_pid_registered(Pid, Channels) of
-        true  -> NewChannels =
-                     amqp_channel_util:unregister_channel_pid(Pid, Channels),
-                 {noreply, State#state{framing_channels = NewChannels}};
-        false -> {stop, {unexpected_down, Pid, Info}, State}
-    end.
-
-internal_register_framing_channel(
-            Number, Pid, State = #state{framing_channels = Channels}) ->
-    NewChannels = amqp_channel_util:register_channel(Number, Pid, Channels),
-    erlang:monitor(process, Pid),
-    State#state{framing_channels = NewChannels}.
+resolve_channel_number(0, #state{framing0 = Framing0}) ->
+    Framing0;
+resolve_channel_number(Number, #state{channels_manager = ChMgr}) ->
+    amqp_channels_manager:get_framing(ChMgr, Number).
