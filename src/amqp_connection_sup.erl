@@ -43,7 +43,11 @@ start_link(Type, AmqpParams) ->
                                             [Type]},
                           intrinsic, infinity, supervisor,
                           [amqp_channel_sup_sup]}),
-    start_connection(Sup, Type, AmqpParams, ChSupSup,
+    {ok, ChMgr} = supervisor2:start_child(Sup,
+                      {channels_manager, {amqp_channels_manager, start_link,
+                                          [ChSupSup]},
+                       intrinsic, ?MAX_WAIT, worker, [amqp_channels_manager]}),
+    start_connection(Sup, Type, AmqpParams, ChMgr,
                      start_infrastructure_fun(Sup, Type)),
     {ok, Sup}.
     
@@ -51,15 +55,15 @@ start_link(Type, AmqpParams) ->
 %% Internal plumbing
 %%---------------------------------------------------------------------------
 
-start_connection(Sup, network, AmqpParams, ChSupSup, SIF) ->
+start_connection(Sup, network, AmqpParams, ChMgr, SIF) ->
     {ok, _} = supervisor2:start_child(Sup,
                   {connection, {amqp_network_connection, start_link,
-                                [AmqpParams, ChSupSup, SIF]},
+                                [AmqpParams, ChMgr, SIF]},
                    intrinsic, brutal_kill, worker, [amqp_network_connection]});
-start_connection(Sup, direct, AmqpParams, ChSupSup, SIF) ->
+start_connection(Sup, direct, AmqpParams, ChMgr, SIF) ->
     {ok, _} = supervisor2:start_child(Sup,
                   {connection, {amqp_direct_connection, start_link,
-                                [AmqpParams, ChSupSup, SIF]},
+                                [AmqpParams, ChMgr, SIF]},
                    intrinsic, brutal_kill, worker, [amqp_direct_connection]}).
 
 start_infrastructure_fun(Sup, network) ->

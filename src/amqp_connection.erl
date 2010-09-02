@@ -106,26 +106,34 @@ start(Type, AmqpParams) ->
 %% Commands
 %%---------------------------------------------------------------------------
 
-%% @doc Invokes open_channel(ConnectionPid, none, &lt;&lt;&gt;&gt;). 
+%% @doc Invokes open_channel(ConnectionPid, none). 
 %% Opens a channel without having to specify a channel number.
 open_channel(ConnectionPid) ->
     open_channel(ConnectionPid, none).
 
-%% @spec (ConnectionPid, ChannelNumber) -> ChannelPid
+%% @spec (ConnectionPid, ChannelNumber) -> {ok, ChannelPid} | {error, term()}
 %% where
-%%      ChannelNumber = integer()
+%%      ChannelNumber = integer() | 'none'
 %%      ConnectionPid = pid()
 %%      ChannelPid = pid()
 %% @doc Opens an AMQP channel.
 %% This function assumes that an AMQP connection (networked or direct)
 %% has already been successfully established.
 open_channel(ConnectionPid, ChannelNumber) ->
-    command(ConnectionPid, {open_channel, ChannelNumber}).
+    case command(ConnectionPid, {open_channel, ChannelNumber}) of
+        {ok, ChannelPid} ->
+            case amqp_channel:call(ChannelPid, #'channel.open'{}) of
+                #'channel.open_ok'{} -> {ok, ChannelPid};
+                Error                -> Error
+            end;
+        Error ->
+            Error
+    end.
 
 %% @spec (ConnectionPid) -> ok | Error
 %% where
 %%      ConnectionPid = pid()
-%% @doc Closes the channel, invokes close(Channel, 200, &lt;&lt;"Goodbye">>).
+%% @doc Closes the channel, invokes close(Channel, 200, &lt;&lt;"Goodbye"&gt;&gt;).
 close(ConnectionPid) ->
     close(ConnectionPid, 200, <<"Goodbye">>).
 
@@ -164,7 +172,7 @@ close(ConnectionPid, Code, Text) ->
 %%          connection
 %%      num_channels - returns the number of channels currently open under the
 %%          connection (excluding channel 0)
-%%      max_channel - returns the max_channel value negotiated with the server
+%%      channel_max - returns the channel_max value negotiated with the server
 %%          (only for the network connection)
 %%      heartbeat - returns the heartbeat value negotiated with the server
 %%          (only for the network connection)

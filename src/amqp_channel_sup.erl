@@ -71,9 +71,6 @@ start_infrastructure_fun(Sup, network, [Sock, MainReader], ChNumber) ->
                                      [Sock, ChNumber, ?FRAME_MIN_SIZE,
                                       ?PROTOCOL, MainReader]},
                             intrinsic, ?MAX_WAIT, worker, [rabbit_writer]}),
-        %% This call will disappear as part of bug 23024
-        amqp_main_reader:register_framing_channel(MainReader, ChNumber,
-                                                  Framing),
         {Writer}
     end.
 
