@@ -104,8 +104,6 @@ handle_info({'EXIT', Pid, Reason}, State) ->
 terminate(_Reason, #nc_state{channel0_framing_pid = Framing0Pid,
                              channel0_writer_pid = Writer0Pid,
                              main_reader_pid = MainReaderPid}) ->
-    ok = amqp_channel_util:terminate_channel_infrastructure(
-                 network, {Framing0Pid, Writer0Pid}),
     case MainReaderPid of
         undefined -> ok;
         _         -> MainReaderPid ! close,
@@ -402,9 +400,11 @@ handshake(State = #nc_state{params = #amqp_params{host = Host,
 
 do_handshake(State0 = #nc_state{sock = Sock}) ->
     ok = rabbit_net:send(Sock, ?PROTOCOL_HEADER),
+    {ok, ConnectionSup} = supervisor:start_link(amqp_connection_sup, none),
     {Framing0Pid, Writer0Pid} =
-        amqp_channel_util:start_channel_infrastructure(network, 0, {Sock, none}),
-    MainReaderPid = amqp_main_reader:start(Sock, Framing0Pid),
+        amqp_channel_util:start_channel_infrastructure(network, ConnectionSup, 0,
+            {Sock, none}),
+    MainReaderPid = amqp_main_reader:start(ConnectionSup, Sock, Framing0Pid),
     State1 = State0#nc_state{channel0_framing_pid = Framing0Pid,
                              channel0_writer_pid = Writer0Pid,
                              main_reader_pid = MainReaderPid},
@@ -422,16 +422,14 @@ network_handshake(State = #nc_state{channel0_writer_pid = Writer0,
     TuneOk = negotiate_values(Tune, Params),
     amqp_channel_util:do(network, Writer0, TuneOk, none),
     ConnectionOpen =
-        #'connection.open'{virtual_host = Params#amqp_params.virtual_host,
-                           insist = true},
+        #'connection.open'{virtual_host = Params#amqp_params.virtual_host},
     amqp_channel_util:do(network, Writer0, ConnectionOpen, none),
-    %% 'connection.redirect' not implemented (we use insist = true to cover)
     #'connection.open_ok'{} = handshake_recv(State),
     #'connection.tune_ok'{channel_max = ChannelMax,
                           frame_max   = FrameMax,
                           heartbeat   = Heartbeat} = TuneOk,
     ?LOG_INFO("Negotiated maximums: (Channel = ~p, "
-              "Frame= ~p, Heartbeat=~p)~n",
+              "Frame = ~p, Heartbeat = ~p)~n",
              [ChannelMax, FrameMax, Heartbeat]),
     State#nc_state{max_channel = ChannelMax,
                    heartbeat = Heartbeat,

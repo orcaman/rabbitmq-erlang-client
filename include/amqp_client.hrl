@@ -23,11 +23,16 @@
 %%   Contributor(s): Ben Hood <0x6e6562@gmail.com>.
 %%
 
+-include("version.hrl").
+
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
 
+-define(PROTOCOL_VERSION_MAJOR, 0).
+-define(PROTOCOL_VERSION_MINOR, 8).
 -define(PROTOCOL_HEADER,
         <<"AMQP", 1, 1, ?PROTOCOL_VERSION_MAJOR, ?PROTOCOL_VERSION_MINOR>>).
+-define(PROTOCOL, amqp_0_8).
 
 -define(MAX_CHANNEL_NUMBER, 65535).
 
@@ -44,6 +49,14 @@
                       ssl_options       = none,
                       client_properties = []}).
 
--define(LOG_DEBUG(Format), error_logger:info_msg(Format)).
 -define(LOG_INFO(Format, Args), error_logger:info_msg(Format, Args)).
 -define(LOG_WARN(Format, Args), error_logger:warning_msg(Format, Args)).
+
+%% Enable debug output by setting env var DEBUG_OUTPUT="true" when running make
+%% targets
+-ifdef(enable_debug_output).
+-define(LOG_DEBUG(Format, Args), error_logger:info_msg(Format, Args)).
+-else.
+%% Avoid a warning (this does nothing)
+-define(LOG_DEBUG(Format, Args), fun() -> {Format, Args} end()).
+-endif.
