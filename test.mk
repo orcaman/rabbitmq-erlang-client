@@ -62,11 +62,11 @@ run_test_broker: start_test_broker_node unboot_broker
 
 start_test_broker_node: boot_broker
 	sleep 1
-	$(RABBITMQCTL) delete_user test_user_no_perm 2>/dev/null || true
+	- $(RABBITMQCTL) delete_user test_user_no_perm
 	$(RABBITMQCTL) add_user test_user_no_perm test_user_no_perm
 
 stop_test_broker_node:
-	$(RABBITMQCTL) delete_user test_user_no_perm || true
+	- $(RABBITMQCTL) delete_user test_user_no_perm
 	$(MAKE) unboot_broker
 
 boot_broker:
