@@ -78,7 +78,7 @@ handle_message({socket_error, _} = SocketError, State) ->
     {stop, SocketError, State};
 handle_message({channel_exit, _, Reason}, State) ->
     {stop, {channel0_died, Reason}, State};
-handle_message(timeout, State) ->
+handle_message(heartbeat_timeout, State) ->
     {stop, heartbeat_timeout, State}.
 
 closing(_ChannelCloseType, Reason, State) ->
@@ -179,9 +179,7 @@ tune(#'connection.tune'{channel_max = ServerChannelMax,
                         heartbeat   = ServerHeartbeat},
      #amqp_params{channel_max = ClientChannelMax,
                   frame_max   = ClientFrameMax,
-                  heartbeat   = ClientHeartbeat},
-     SHF,
-     State = #state{sock = Sock}) ->
+                  heartbeat   = ClientHeartbeat}, SHF, State) ->
     [ChannelMax, Heartbeat, FrameMax] =
         lists:zipwith(fun (Client, Server) when Client =:= 0; Server =:= 0 ->
                               lists:max([Client, Server]);
@@ -189,11 +187,23 @@ tune(#'connection.tune'{channel_max = ServerChannelMax,
                               lists:min([Client, Server])
                       end, [ClientChannelMax, ClientHeartbeat, ClientFrameMax],
                            [ServerChannelMax, ServerHeartbeat, ServerFrameMax]),
-    SHF(Sock, Heartbeat),
+    start_heartbeat(SHF, State),
     {#'connection.tune_ok'{channel_max = ChannelMax,
                            frame_max   = FrameMax,
                            heartbeat   = Heartbeat},
      ChannelMax, State#state{heartbeat = Heartbeat, frame_max = FrameMax}}.
+
+start_heartbeat(SHF, #state{sock = Sock, heartbeat = Heartbeat}) ->
+    SendFun = fun() ->
+                      Frame = rabbit_binary_generator:build_heartbeat_frame(),
+                      catch rabbit_net:send(Sock, Frame)
+              end,
+
+    Connection = self(),
+    ReceiveFun = fun() ->
+                         Connection ! heartbeat_timeout
+                 end,
+    SHF(Sock, Heartbeat, SendFun, Heartbeat, ReceiveFun).
 
 start_ok(#amqp_params{username          = Username,
                       password          = Password,
@@ -248,7 +258,7 @@ handshake_recv(Phase) ->
             end;
         {socket_error, _} = SocketError ->
             exit({SocketError, Phase});
-        timeout ->
+        heartbeat_timeout ->
             exit(heartbeat_timeout);
         Other ->
             exit({handshake_recv_unexpected_message, Other})
