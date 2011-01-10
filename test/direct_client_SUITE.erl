@@ -60,26 +60,23 @@ basic_ack_test() ->
 basic_ack_call_test() ->
     test_util:basic_ack_call_test(new_connection()).
 
-sync_method_serialization_test() ->
+sync_method_serialization_test_() ->
     {timeout, 60,
         fun () ->
                 test_util:sync_method_serialization_test(new_connection())
         end}.
 
-async_sync_method_serialization_test() ->
+async_sync_method_serialization_test_() ->
     {timeout, 60,
         fun () ->
                 test_util:async_sync_method_serialization_test(new_connection())
         end}.
 
-sync_async_method_serialization_test() ->
+sync_async_method_serialization_test_() ->
     {timeout, 60,
         fun () ->
                 test_util:sync_async_method_serialization_test(new_connection())
         end}.
-
-recover_after_cancel_test() ->
-    test_util:recover_after_cancel_test(new_connection()).
 
 queue_unbind_test() ->
     test_util:queue_unbind_test(new_connection()).
