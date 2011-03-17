@@ -31,9 +31,8 @@
 -export([call/2, call/3, cast/2, cast/3]).
 -export([subscribe/3]).
 -export([close/1, close/3]).
--export([register_return_handler/2]).
--export([register_flow_handler/2]).
--export([register_confirm_handler/2]).
+-export([register_return_handler/2, register_flow_handler/2,
+         register_confirm_handler/2]).
 -export([next_publish_seqno/1]).
 -export([register_default_consumer/2]).
 
@@ -155,7 +154,7 @@ close(Channel, Code, Text) ->
 %% @doc When in confirm mode, returns the sequence number of the next
 %% message to be published.
 next_publish_seqno(Channel) ->
-    gen_server:call(Channel, next_publish_seqno).
+    gen_server:call(Channel, next_publish_seqno, infinity).
 
 %%---------------------------------------------------------------------------
 %% Consumer registration (API)
@@ -342,8 +341,12 @@ handle_info({send_command_and_notify, Q, ChPid, Method, Content}, State) ->
     {noreply, State};
 %% This comes from the writer or rabbit_channel
 %% @private
-handle_info({channel_exit, _FrPidOrChNumber, Reason}, State) ->
+handle_info({channel_exit, _ChNumber, Reason}, State) ->
     handle_channel_exit(Reason, State);
+%% This comes from rabbit_channel in the direct case
+handle_info({channel_closing, ChPid}, State) ->
+    ok = rabbit_channel:ready_for_close(ChPid),
+    {noreply, State};
 %% @private
 handle_info(timed_out_flushing_channel, State) ->
     ?LOG_WARN("Channel (~p) closing: timed out flushing while "
@@ -606,6 +609,12 @@ handle_method_from_server1(
         _    -> ReturnHandler ! {BasicReturn, AmqpMsg}
     end,
     {noreply, State};
+handle_method_from_server1(#'basic.cancel'{consumer_tag = ConsumerTag} = Death,
+                           none, State) ->
+    Consumer = resolve_consumer(ConsumerTag, State),
+    Consumer ! Death,
+    NewState = unregister_consumer(ConsumerTag, State),
+    {noreply, NewState};
 handle_method_from_server1(#'basic.ack'{} = BasicAck, none,
                            #state{confirm_handler_pid = none} = State) ->
     ?LOG_WARN("Channel (~p): received ~p but there is no "
@@ -758,9 +767,9 @@ is_connection_method(Method) ->
 
 server_misbehaved(#amqp_error{} = AmqpError, State = #state{number = Number}) ->
     case rabbit_binary_generator:map_exception(Number, AmqpError, ?PROTOCOL) of
-        {true, _, _} ->
+        {0, _} ->
             {stop, {server_misbehaved, AmqpError}, State};
-        {false, _, Close} ->
+        {_, Close} ->
             ?LOG_WARN("Channel (~p) flushing and closing due to soft "
                       "error caused by the server ~p~n", [self(), AmqpError]),
             Self = self(),
