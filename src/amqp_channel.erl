@@ -521,8 +521,9 @@ rpc_top_half(Method, Content, From,
 rpc_bottom_half(Reply, State = #state{rpc_requests = RequestQueue}) ->
     {{value, {From, _Method, _Content}}, RequestQueue1} =
         queue:out(RequestQueue),
-    case From of none -> ok;
-                 _    -> gen_server:reply(From, Reply)
+    case From of
+        none -> ok;
+        _    -> gen_server:reply(From, Reply)
     end,
     do_rpc(State#state{rpc_requests = RequestQueue1}).
 
@@ -579,7 +580,7 @@ handle_method_from_server(Method, Content, State = #state{closing = Closing}) ->
                          {{just_channel, _}, #'channel.close'{}}    -> false;
                          {{just_channel, _}, #'channel.close_ok'{}} -> false;
                          {{just_channel, _}, _}                     -> true;
-                         _                                             -> false
+                         _                                          -> false
                      end,
                  if Drop -> ?LOG_INFO("Channel (~p): dropping method ~p from "
                                       "server because channel is closing~n",
@@ -609,13 +610,14 @@ handle_method_from_server1(#'channel.close'{reply_code = Code,
     handle_shutdown({server_initiated_close, Code, Text}, State);
 handle_method_from_server1(#'channel.close_ok'{}, none,
                            State = #state{closing = Closing}) ->
-    case Closing of {just_channel, {app_initiated_close, _, _} = Reason} ->
-                        handle_shutdown(Reason, rpc_bottom_half(ok, State));
-                    {just_channel, {server_initiated_close, _, _} = Reason} ->
-                        handle_shutdown(Reason,
-                                        rpc_bottom_half(closing, State));
-                    {connection, Reason} ->
-                        handle_shutdown({connection_closing, Reason}, State)
+    case Closing of
+        {just_channel, {app_initiated_close, _, _} = Reason} ->
+            handle_shutdown(Reason, rpc_bottom_half(ok, State));
+        {just_channel, {server_initiated_close, _, _} = Reason} ->
+            handle_shutdown(Reason,
+                            rpc_bottom_half(closing, State));
+        {connection, Reason} ->
+            handle_shutdown({connection_closing, Reason}, State)
     end;
 handle_method_from_server1(
         #'basic.consume_ok'{consumer_tag = ConsumerTag} = ConsumeOk,
