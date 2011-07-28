@@ -58,6 +58,9 @@ rpc_test_()                             -> ?RUN([]).
 pub_and_close_test_()                   -> ?RUN([{timeout, 60}]).
 channel_tune_negotiation_test_()        -> ?RUN([]).
 confirm_test_()                         -> ?RUN([]).
+confirm_barrier_test_()                 -> ?RUN([]).
+confirm_barrier_nop_test_()             -> ?RUN([]).
+default_consumer_test()                 -> ?RUN([]).
 subscribe_nowait_test_()                -> ?RUN([]).
 
 non_existent_exchange_test_()           -> ?RUN([negative]).

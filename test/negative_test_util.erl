@@ -24,12 +24,12 @@
 non_existent_exchange_test() ->
     Connection = test_util:new_connection(),
     X = test_util:uuid(),
-    RoutingKey = <<"a">>, 
+    RoutingKey = <<"a">>,
     Payload = <<"foobar">>,
     {ok, Channel} = amqp_connection:open_channel(Connection),
     {ok, OtherChannel} = amqp_connection:open_channel(Connection),
     amqp_channel:call(Channel, #'exchange.declare'{exchange = X}),
-    
+
     %% Deliberately mix up the routingkey and exchange arguments
     Publish = #'basic.publish'{exchange = RoutingKey, routing_key = X},
     amqp_channel:call(Channel, Publish, #amqp_msg{payload = Payload}),
@@ -177,20 +177,18 @@ assert_down_with_error(MonitorRef, CodeAtom) ->
     end.
 
 non_existent_user_test() ->
-    Params = #amqp_params{username = test_util:uuid(),
-                          password = test_util:uuid()},
+    Params = [{username, test_util:uuid()}, {password, test_util:uuid()}],
     ?assertMatch({error, auth_failure}, test_util:new_connection(Params)).
 
 invalid_password_test() ->
-    Params = #amqp_params{username = <<"guest">>,
-                          password = test_util:uuid()},
+    Params = [{username, <<"guest">>}, {password, test_util:uuid()}],
     ?assertMatch({error, auth_failure}, test_util:new_connection(Params)).
 
 non_existent_vhost_test() ->
-    Params = #amqp_params{virtual_host = test_util:uuid()},
+    Params = [{virtual_host, test_util:uuid()}],
     ?assertMatch({error, access_refused}, test_util:new_connection(Params)).
 
 no_permission_test() ->
-    Params = #amqp_params{username = <<"test_user_no_perm">>,
-                          password = <<"test_user_no_perm">>},
+    Params = [{username, <<"test_user_no_perm">>},
+              {password, <<"test_user_no_perm">>}],
     ?assertMatch({error, access_refused}, test_util:new_connection(Params)).

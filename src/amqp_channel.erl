@@ -68,11 +68,11 @@
 
 -export([call/2, call/3, cast/2, cast/3]).
 -export([close/1, close/3]).
--export([next_publish_seqno/1]).
 -export([register_return_handler/2, register_flow_handler/2,
          register_confirm_handler/2]).
--export([call_consumer/2]).
-
+-export([call_consumer/2, subscribe/3]).
+-export([next_publish_seqno/1, wait_for_confirms/1,
+         wait_for_confirms_or_die/1]).
 -export([start_link/5, connection_closing/3, open/1]).
 
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
@@ -83,6 +83,7 @@
 
 -record(state, {number,
                 connection,
+                consumer,
                 driver,
                 rpc_requests        = queue:new(),
                 closing             = false, %% false |
@@ -94,9 +95,10 @@
                 next_pub_seqno      = 0,
                 flow_active         = true,
                 flow_handler_pid    = none,
-                consumer_module,
-                consumer_state,
-                start_writer_fun
+                start_writer_fun,
+                unconfirmed_set     = gb_sets:new(),
+                waiting_set         = gb_trees:empty(),
+                only_acks_received  = true
                }).
 
 %%---------------------------------------------------------------------------
@@ -129,7 +131,7 @@
 %% @spec (Channel, Method) -> Result
 %% @doc This is equivalent to amqp_channel:call(Channel, Method, none).
 call(Channel, Method) ->
-    gen_server:call(Channel, {call, Method, none}, infinity).
+    gen_server:call(Channel, {call, Method, none, self()}, infinity).
 
 %% @spec (Channel, Method, Content) -> Result
 %% where
@@ -152,12 +154,12 @@ call(Channel, Method) ->
 %% the broker. It does not necessarily imply that the broker has
 %% accepted responsibility for the message.
 call(Channel, Method, Content) ->
-    gen_server:call(Channel, {call, Method, Content}, infinity).
+    gen_server:call(Channel, {call, Method, Content, self()}, infinity).
 
 %% @spec (Channel, Method) -> ok
 %% @doc This is equivalent to amqp_channel:cast(Channel, Method, none).
 cast(Channel, Method) ->
-    gen_server:cast(Channel, {cast, Method, none}).
+    gen_server:cast(Channel, {cast, Method, none, self()}).
 
 %% @spec (Channel, Method, Content) -> ok
 %% where
@@ -169,7 +171,7 @@ cast(Channel, Method) ->
 %% This function is not recommended with synchronous methods, since there is no
 %% way to verify that the server has received the method.
 cast(Channel, Method, Content) ->
-    gen_server:cast(Channel, {cast, Method, Content}).
+    gen_server:cast(Channel, {cast, Method, Content, self()}).
 
 %% @spec (Channel) -> ok | closing
 %% where
@@ -196,6 +198,24 @@ close(Channel, Code, Text) ->
 %% message to be published.
 next_publish_seqno(Channel) ->
     gen_server:call(Channel, next_publish_seqno, infinity).
+
+%% @spec (Channel) -> boolean()
+%% where
+%%      Channel = pid()
+%% @doc Wait until all messages published since the last call have
+%% been either ack'd or nack'd by the broker.  Note, when called on a
+%% non-Confirm channel, waitForConfirms returns true immediately.
+wait_for_confirms(Channel) ->
+    gen_server:call(Channel, wait_for_confirms, infinity).
+
+%% @spec (Channel) -> true
+%% where
+%%      Channel = pid()
+%% @doc Behaves the same as wait_for_confirms/1, but if a nack is
+%% received, the calling process is immediately sent an
+%% exit(nack_received).
+wait_for_confirms_or_die(Channel) ->
+    gen_server:call(Channel, {wait_for_confirms_or_die, self()}, infinity).
 
 %% @spec (Channel, ReturnHandler) -> ok
 %% where
@@ -226,15 +246,25 @@ register_confirm_handler(Channel, ConfirmHandler) ->
 register_flow_handler(Channel, FlowHandler) ->
     gen_server:cast(Channel, {register_flow_handler, FlowHandler} ).
 
-%% @spec (Channel, Message) -> ok
+%% @spec (Channel, Msg) -> ok
 %% where
 %%      Channel = pid()
-%%      Message = any()
+%%      Msg    = any()
 %% @doc This causes the channel to invoke Consumer:handle_call/2,
 %% where Consumer is the amqp_gen_consumer implementation registered with
 %% the channel.
-call_consumer(Channel, Call) ->
-    gen_server:call(Channel, {call_consumer, Call}, infinity).
+call_consumer(Channel, Msg) ->
+    gen_server:call(Channel, {call_consumer, Msg}, infinity).
+
+%% @spec (Channel, BasicConsume, Subscriber) -> ok
+%% where
+%%      Channel = pid()
+%%      BasicConsume = amqp_method()
+%%      Subscriber = pid()
+%% @doc Subscribe the given pid to a queue using the specified
+%% basic.consume method.
+subscribe(Channel, BasicConsume = #'basic.consume'{}, Subscriber) ->
+    gen_server:call(Channel, {subscribe, BasicConsume, Subscriber}, infinity).
 
 %%---------------------------------------------------------------------------
 %% Internal interface
@@ -258,24 +288,22 @@ open(Pid) ->
 %%---------------------------------------------------------------------------
 
 %% @private
-init([Driver, Connection, ChannelNumber, {ConsumerModule, ConsumerArgs},
-      SWF]) ->
-    State0 = #state{connection       = Connection,
-                    driver           = Driver,
-                    number           = ChannelNumber,
-                    consumer_module  = ConsumerModule,
-                    start_writer_fun = SWF},
-    {ok, consumer_callback(init, [ConsumerArgs], State0)}.
+init([Driver, Connection, ChannelNumber, Consumer, SWF]) ->
+    {ok, #state{connection       = Connection,
+                driver           = Driver,
+                number           = ChannelNumber,
+                consumer         = Consumer,
+                start_writer_fun = SWF}}.
 
 %% @private
 handle_call(open, From, State) ->
-    {noreply, rpc_top_half(#'channel.open'{}, none, From, State)};
+    {noreply, rpc_top_half(#'channel.open'{}, none, From, none, State)};
 %% @private
 handle_call({close, Code, Text}, From, State) ->
     handle_close(Code, Text, From, State);
 %% @private
-handle_call({call, Method, AmqpMsg}, From, State) ->
-    handle_method_to_server(Method, AmqpMsg, From, State);
+handle_call({call, Method, AmqpMsg, Sender}, From, State) ->
+    handle_method_to_server(Method, AmqpMsg, From, Sender, State);
 %% Handles the delivery of messages from a direct channel
 %% @private
 handle_call({send_command_sync, Method, Content}, From, State) ->
@@ -292,13 +320,25 @@ handle_call({send_command_sync, Method}, From, State) ->
 handle_call(next_publish_seqno, _From,
             State = #state{next_pub_seqno = SeqNo}) ->
     {reply, SeqNo, State};
+
+handle_call(wait_for_confirms, From, State) ->
+    handle_wait_for_confirms(From, none, true, State);
+
+%% Lets the channel know that the process should be sent an exit
+%% signal if a nack is received.
+handle_call({wait_for_confirms_or_die, Pid}, From, State) ->
+    handle_wait_for_confirms(From, Pid, ok, State);
 %% @private
-handle_call({call_consumer, Call}, _From, State) ->
-    handle_consumer_callback(handle_call, [Call], State).
+handle_call({call_consumer, Msg}, _From,
+            State = #state{consumer = Consumer}) ->
+    {reply, amqp_gen_consumer:call_consumer(Consumer, Msg), State};
+%% @private
+handle_call({subscribe, BasicConsume, Subscriber}, From, State) ->
+    handle_method_to_server(BasicConsume, none, From, Subscriber, State).
 
 %% @private
-handle_cast({cast, Method, AmqpMsg}, State) ->
-    handle_method_to_server(Method, AmqpMsg, none, State);
+handle_cast({cast, Method, AmqpMsg, Sender}, State) ->
+    handle_method_to_server(Method, AmqpMsg, none, Sender, State);
 %% @private
 handle_cast({register_return_handler, ReturnHandler}, State) ->
     erlang:monitor(process, ReturnHandler),
@@ -377,8 +417,8 @@ handle_info({'DOWN', _, process, FlowHandler, Reason},
     {noreply, State#state{flow_handler_pid = none}}.
 
 %% @private
-terminate(Reason, State) ->
-    consumer_callback(terminate, [Reason], State).
+terminate(_Reason, State) ->
+    State.
 
 %% @private
 code_change(_OldVsn, State, _Extra) ->
@@ -388,7 +428,8 @@ code_change(_OldVsn, State, _Extra) ->
 %% RPC mechanism
 %%---------------------------------------------------------------------------
 
-handle_method_to_server(Method, AmqpMsg, From, State) ->
+handle_method_to_server(Method, AmqpMsg, From, Sender,
+                        State = #state{unconfirmed_set = USet}) ->
     case {check_invalid_method(Method), From,
           check_block(Method, AmqpMsg, State)} of
         {ok, _, ok} ->
@@ -398,12 +439,14 @@ handle_method_to_server(Method, AmqpMsg, From, State) ->
                          {#'basic.publish'{}, 0} ->
                              State;
                          {#'basic.publish'{}, SeqNo} ->
-                             State#state{next_pub_seqno = SeqNo + 1};
+                             State#state{unconfirmed_set =
+                                             gb_sets:add(SeqNo, USet),
+                                         next_pub_seqno = SeqNo + 1};
                          _ ->
                              State
                      end,
-            {noreply,
-             rpc_top_half(Method, build_content(AmqpMsg), From, State1)};
+            {noreply, rpc_top_half(Method, build_content(AmqpMsg),
+                                   From, Sender, State1)};
         {ok, none, BlockReply} ->
             ?LOG_WARN("Channel (~p): discarding method ~p in cast.~n"
                       "Reason: ~p~n", [self(), Method, BlockReply]),
@@ -424,21 +467,22 @@ handle_close(Code, Text, From, State) ->
                              class_id   = 0,
                              method_id  = 0},
     case check_block(Close, none, State) of
-        ok         -> {noreply, rpc_top_half(Close, none, From, State)};
+        ok         -> {noreply, rpc_top_half(Close, none, From, none, State)};
         BlockReply -> {reply, BlockReply, State}
     end.
 
-rpc_top_half(Method, Content, From,
+rpc_top_half(Method, Content, From, Sender,
              State0 = #state{rpc_requests = RequestQueue}) ->
     State1 = State0#state{
-        rpc_requests = queue:in({From, Method, Content}, RequestQueue)},
+        rpc_requests =
+                   queue:in({From, Sender, Method, Content}, RequestQueue)},
     IsFirstElement = queue:is_empty(RequestQueue),
     if IsFirstElement -> do_rpc(State1);
        true           -> State1
     end.
 
 rpc_bottom_half(Reply, State = #state{rpc_requests = RequestQueue}) ->
-    {{value, {From, _Method, _Content}}, RequestQueue1} =
+    {{value, {From, _Sender, _Method, _Content}}, RequestQueue1} =
         queue:out(RequestQueue),
     case From of
         none -> ok;
@@ -449,8 +493,8 @@ rpc_bottom_half(Reply, State = #state{rpc_requests = RequestQueue}) ->
 do_rpc(State = #state{rpc_requests = Q,
                       closing      = Closing}) ->
     case queue:out(Q) of
-        {{value, {From, Method, Content}}, NewQ} ->
-            State1 = pre_do(Method, Content, State),
+        {{value, {From, Sender, Method, Content}}, NewQ} ->
+            State1 = pre_do(Method, Content, Sender, State),
             DoRet = do(Method, Content, State1),
             case ?PROTOCOL:is_method_synchronous(Method) of
                 true  -> State1;
@@ -475,15 +519,18 @@ do_rpc(State = #state{rpc_requests = Q,
     end.
 
 pending_rpc_method(#state{rpc_requests = Q}) ->
-    {value, {_From, Method, _Content}} = queue:peek(Q),
+    {value, {_From, _Sender, Method, _Content}} = queue:peek(Q),
     Method.
 
-pre_do(#'channel.open'{}, none, State) ->
+pre_do(#'channel.open'{}, none, _Sender, State) ->
     start_writer(State);
 pre_do(#'channel.close'{reply_code = Code, reply_text = Text}, none,
-       State) ->
+       _Sender, State) ->
     State#state{closing = {just_channel, {app_initiated_close, Code, Text}}};
-pre_do(_, _, State) ->
+pre_do(#'basic.consume'{} = Method, none, Sender, State) ->
+    ok = call_to_consumer(Method, Sender, State),
+    State;
+pre_do(_, _, _, State) ->
     State.
 
 %%---------------------------------------------------------------------------
@@ -543,12 +590,18 @@ handle_method_from_server1(#'channel.close_ok'{}, none,
     end;
 handle_method_from_server1(#'basic.consume_ok'{} = ConsumeOk, none, State) ->
     Consume = #'basic.consume'{} = pending_rpc_method(State),
-    State1 = consumer_callback(handle_consume_ok, [ConsumeOk, Consume], State),
-    {noreply, rpc_bottom_half(ConsumeOk, State1)};
+    ok = call_to_consumer(ConsumeOk, Consume, State),
+    {noreply, rpc_bottom_half(ConsumeOk, State)};
 handle_method_from_server1(#'basic.cancel_ok'{} = CancelOk, none, State) ->
     Cancel = #'basic.cancel'{} = pending_rpc_method(State),
-    State1 = consumer_callback(handle_cancel_ok, [CancelOk, Cancel], State),
-    {noreply, rpc_bottom_half(CancelOk, State1)};
+    ok = call_to_consumer(CancelOk, Cancel, State),
+    {noreply, rpc_bottom_half(CancelOk, State)};
+handle_method_from_server1(#'basic.cancel'{} = Cancel, none, State) ->
+    ok = call_to_consumer(Cancel, none, State),
+    {noreply, State};
+handle_method_from_server1(#'basic.deliver'{} = Deliver, AmqpMsg, State) ->
+    ok = call_to_consumer(Deliver, AmqpMsg, State),
+    {noreply, State};
 handle_method_from_server1(#'channel.flow'{active = Active} = Flow, none,
                            State = #state{flow_handler_pid = FlowHandler}) ->
     case FlowHandler of none -> ok;
@@ -558,9 +611,7 @@ handle_method_from_server1(#'channel.flow'{active = Active} = Flow, none,
     %% flushed beforehand. Methods that made it to the queue are not
     %% blocked in any circumstance.
     {noreply, rpc_top_half(#'channel.flow_ok'{active = Active}, none, none,
-                           State#state{flow_active = Active})};
-handle_method_from_server1(#'basic.deliver'{} = Deliver, AmqpMsg, State) ->
-    handle_consumer_callback(handle_deliver, [{Deliver, AmqpMsg}], State);
+                           none, State#state{flow_active = Active})};
 handle_method_from_server1(
         #'basic.return'{} = BasicReturn, AmqpMsg,
         State = #state{return_handler_pid = ReturnHandler}) ->
@@ -571,28 +622,26 @@ handle_method_from_server1(
         _    -> ReturnHandler ! {BasicReturn, AmqpMsg}
     end,
     {noreply, State};
-handle_method_from_server1(#'basic.cancel'{} = Cancel, none, State) ->
-    handle_consumer_callback(handle_cancel, [Cancel], State);
 handle_method_from_server1(#'basic.ack'{} = BasicAck, none,
                            #state{confirm_handler_pid = none} = State) ->
     ?LOG_WARN("Channel (~p): received ~p but there is no "
               "confirm handler registered~n", [self(), BasicAck]),
-    {noreply, State};
+    {noreply, update_confirm_set(BasicAck, State)};
 handle_method_from_server1(
         #'basic.ack'{} = BasicAck, none,
         #state{confirm_handler_pid = ConfirmHandler} = State) ->
     ConfirmHandler ! BasicAck,
-    {noreply, State};
+    {noreply, update_confirm_set(BasicAck, State)};
 handle_method_from_server1(#'basic.nack'{} = BasicNack, none,
                            #state{confirm_handler_pid = none} = State) ->
     ?LOG_WARN("Channel (~p): received ~p but there is no "
               "confirm handler registered~n", [self(), BasicNack]),
-    {noreply, State};
+    {noreply, update_confirm_set(BasicNack, handle_nack(State))};
 handle_method_from_server1(
         #'basic.nack'{} = BasicNack, none,
         #state{confirm_handler_pid = ConfirmHandler} = State) ->
     ConfirmHandler ! BasicNack,
-    {noreply, State};
+    {noreply, update_confirm_set(BasicNack, handle_nack(State))};
 
 handle_method_from_server1(Method, none, State) ->
     {noreply, rpc_bottom_half(Method, State)};
@@ -717,25 +766,44 @@ server_misbehaved(#amqp_error{} = AmqpError, State = #state{number = Number}) ->
             {noreply, State}
     end.
 
-handle_consumer_callback(handle_call, Args,
-                         State = #state{consumer_state = CState,
-                                        consumer_module = CModule}) ->
-    {reply, Reply, NewCState} =
-        erlang:apply(CModule, handle_call, Args ++ [CState]),
-    {reply, Reply, State#state{consumer_state = NewCState}};
-handle_consumer_callback(Function, Args, State) ->
-    {noreply, consumer_callback(Function, Args, State)}.
+handle_nack(State = #state{waiting_set = WSet}) ->
+    DyingPids = [Pid || {_, Pid} <- gb_trees:to_list(WSet), Pid =/= none],
+    case DyingPids of
+        [] -> State;
+        _  -> [exit(Pid, nack_received) || Pid <- DyingPids],
+              close(self(), 200, <<"Nacks Received">>)
+    end.
 
-consumer_callback(init, Args, State = #state{}) ->
-    consumer_callback_basic(init, Args, State);
-consumer_callback(terminate, Args, State = #state{consumer_state = CState,
-                                                  consumer_module = CModule}) ->
-    erlang:apply(CModule, terminate, Args ++ [CState]),
-    State;
-consumer_callback(Function, Args, State = #state{consumer_state = CState}) ->
-    consumer_callback_basic(Function, Args ++ [CState], State).
+update_confirm_set(#'basic.ack'{delivery_tag = SeqNo},
+                   State = #state{unconfirmed_set = USet}) ->
+    maybe_notify_waiters(
+      State#state{unconfirmed_set = gb_sets:del_element(SeqNo, USet)});
+update_confirm_set(#'basic.nack'{delivery_tag = SeqNo},
+                   State = #state{unconfirmed_set = USet}) ->
+    maybe_notify_waiters(
+      State#state{unconfirmed_set = gb_sets:del_element(SeqNo, USet),
+                  only_acks_received = false}).
 
-consumer_callback_basic(Function,
-                        Args, State = #state{consumer_module = CModule}) ->
-    {ok, NewCState} = erlang:apply(CModule, Function, Args),
-    State#state{consumer_state = NewCState}.
+maybe_notify_waiters(State = #state{unconfirmed_set = USet}) ->
+    case gb_sets:is_empty(USet) of
+        false -> State;
+        true  -> notify_confirm_waiters(State)
+    end.
+
+notify_confirm_waiters(State = #state{waiting_set = WSet,
+                                      only_acks_received = OAR}) ->
+    [gen_server:reply(From, OAR) || {From, _} <- gb_trees:to_list(WSet)],
+    State#state{waiting_set = gb_trees:empty(),
+                only_acks_received = true}.
+
+handle_wait_for_confirms(From, Notify, EmptyReply,
+                         State = #state{unconfirmed_set = USet,
+                                        waiting_set     = WSet}) ->
+    case gb_sets:is_empty(USet) of
+        true  -> {reply, EmptyReply, State};
+        false -> {noreply, State#state{waiting_set =
+                                           gb_trees:insert(From, Notify, WSet)}}
+    end.
+
+call_to_consumer(Method, Args, #state{consumer = Consumer}) ->
+    amqp_gen_consumer:call_consumer(Consumer, Method, Args).
