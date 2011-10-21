@@ -35,6 +35,111 @@
 %% unsubscribes
 -define(Wait, 200).
 
+%% AMQP URI parsing test
+amqp_uri_parse_test() ->
+    %% From the spec (adapted)
+    ?assertMatch({ok, #amqp_params_network{username     = <<"user">>,
+                                           password     = <<"pass">>,
+                                           host         = "host",
+                                           port         = 10000,
+                                           virtual_host = <<"vhost">>,
+                                           heartbeat    = 5}},
+                 amqp_uri:parse(
+                   "amqp://user:pass@host:10000/vhost?heartbeat=5")),
+    ?assertMatch({ok, #amqp_params_network{username     = <<"usera">>,
+                                           password     = <<"apass">>,
+                                           host         = "hoast",
+                                           port         = 10000,
+                                           virtual_host = <<"v/host">>}},
+                 amqp_uri:parse(
+                   "aMQp://user%61:%61pass@ho%61st:10000/v%2fhost")),
+    ?assertMatch({ok, #amqp_params_direct{}}, amqp_uri:parse("amqp://")),
+    ?assertMatch({ok, #amqp_params_direct{username     = <<"">>,
+                                          virtual_host = <<"">>}},
+                 amqp_uri:parse("amqp://:@/")),
+    ?assertMatch({ok, #amqp_params_network{username     = <<"">>,
+                                           password     = <<"">>,
+                                           virtual_host = <<"">>,
+                                           host         = "host"}},
+                 amqp_uri:parse("amqp://:@host/")),
+    ?assertMatch({ok, #amqp_params_direct{username = <<"user">>}},
+                 amqp_uri:parse("amqp://user@")),
+    ?assertMatch({ok, #amqp_params_network{username = <<"user">>,
+                                           password = <<"pass">>,
+                                           host     = "localhost"}},
+                 amqp_uri:parse("amqp://user:pass@localhost")),
+    ?assertMatch({ok, #amqp_params_network{host         = "host",
+                                           virtual_host = <<"/">>}},
+                 amqp_uri:parse("amqp://host")),
+    ?assertMatch({ok, #amqp_params_network{port = 10000,
+                                           host = "localhost"}},
+                 amqp_uri:parse("amqp://localhost:10000")),
+    ?assertMatch({ok, #amqp_params_direct{virtual_host = <<"vhost">>}},
+                 amqp_uri:parse("amqp:///vhost")),
+    ?assertMatch({ok, #amqp_params_network{host         = "host",
+                                           virtual_host = <<"">>}},
+                 amqp_uri:parse("amqp://host/")),
+    ?assertMatch({ok, #amqp_params_network{host         = "host",
+                                           virtual_host = <<"/">>}},
+                 amqp_uri:parse("amqp://host/%2f")),
+    ?assertMatch({ok, #amqp_params_network{host = "::1"}},
+                 amqp_uri:parse("amqp://[::1]")),
+
+    %% Varous other cases
+    ?assertMatch({ok, #amqp_params_network{host = "host", port = 100}},
+                 amqp_uri:parse("amqp://host:100")),
+    ?assertMatch({ok, #amqp_params_network{host = "::1", port = 100}},
+                 amqp_uri:parse("amqp://[::1]:100")),
+
+    ?assertMatch({ok, #amqp_params_network{host         = "host",
+                                           virtual_host = <<"blah">>}},
+                 amqp_uri:parse("amqp://host/blah")),
+    ?assertMatch({ok, #amqp_params_network{host         = "host",
+                                           port         = 100,
+                                           virtual_host = <<"blah">>}},
+                 amqp_uri:parse("amqp://host:100/blah")),
+    ?assertMatch({ok, #amqp_params_network{host         = "::1",
+                                           virtual_host = <<"blah">>}},
+                 amqp_uri:parse("amqp://[::1]/blah")),
+    ?assertMatch({ok, #amqp_params_network{host         = "::1",
+                                           port         = 100,
+                                           virtual_host = <<"blah">>}},
+                 amqp_uri:parse("amqp://[::1]:100/blah")),
+
+    ?assertMatch({ok, #amqp_params_network{username = <<"user">>,
+                                           password = <<"pass">>,
+                                           host     = "host"}},
+                 amqp_uri:parse("amqp://user:pass@host")),
+    ?assertMatch({ok, #amqp_params_network{username = <<"user">>,
+                                           password = <<"pass">>,
+                                           port     = 100}},
+                 amqp_uri:parse("amqp://user:pass@host:100")),
+    ?assertMatch({ok, #amqp_params_network{username = <<"user">>,
+                                           password = <<"pass">>,
+                                           host     = "::1"}},
+                 amqp_uri:parse("amqp://user:pass@[::1]")),
+    ?assertMatch({ok, #amqp_params_network{username = <<"user">>,
+                                           password = <<"pass">>,
+                                           host     = "::1",
+                                           port     = 100}},
+                 amqp_uri:parse("amqp://user:pass@[::1]:100")),
+
+    %% Various failure cases
+    ?assertMatch({error, _}, amqp_uri:parse("http://www.rabbitmq.com")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo:bar:baz")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo[::1]")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo:[::1]")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://[::1]foo")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo:1000xyz")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo:1000000")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo/bar/baz")),
+
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo%1")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo%1x")),
+    ?assertMatch({error, _}, amqp_uri:parse("amqp://foo%xy")),
+
+    ok.
+
 %%%%
 %%
 %% This is an example of how the client interaction should work
@@ -514,7 +619,7 @@ confirm_barrier_test() ->
     #'confirm.select_ok'{} = amqp_channel:call(Channel, #'confirm.select'{}),
     [amqp_channel:call(Channel, #'basic.publish'{routing_key = <<"whoosh">>},
                        #amqp_msg{payload = <<"foo">>})
-     || _ <- lists:seq(1, 10)],
+     || _ <- lists:seq(1, 1000)], %% Hopefully enough to get a multi-ack
     true = amqp_channel:wait_for_confirms(Channel),
     teardown(Connection, Channel).
 
@@ -540,7 +645,7 @@ default_consumer_test() ->
                 end),
     #'basic.consume_ok'{} =
         amqp_channel:subscribe(Channel, #'basic.consume'{queue = Q}, Pid),
-    monitor(process, Pid),
+    erlang:monitor(process, Pid),
     exit(Pid, shutdown),
     receive
         {'DOWN', _, process, _, _} ->
